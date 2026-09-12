@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# The keybind target. A power switch, not a mute switch (ADR-0002):
+# "off" stops every process and frees VRAM; "on" starts the unit tree.
+#
+#   prometheus-toggle [toggle|on|off]
+exec "$(dirname "$(readlink -f "$0")")/prometheus" "${1:-toggle}"

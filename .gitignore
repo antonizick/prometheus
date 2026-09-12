@@ -1,0 +1,38 @@
+# Generated audio. The listening review (docs/06, task 2.10) produces ~21 MB of
+# WAVs, and they are a build output, not a source: regenerate them in about
+# three minutes with
+#
+#     experiments/build-phrasebook-audio.py
+#
+# The verdicts that came out of listening to them are what matters, and those
+# live in INDEX.md, in the notes, and in phrasebank-vetoed.json — all tracked.
+experiments/phrasebook/by-event/
+experiments/phrasebook/session/
+*.wav
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Editor and tooling leftovers
+*.swp
+*~
+.DS_Store
+
+# Backups made in passing, by us or by an editor
+*.bak
+*.bak.*
+*.orig
+*.rej
+
+# Atomic-write temp files (every state writer here uses write-then-rename)
+*.tmp
+
+# Runtime state and config live in ~/.local/state/prometheus and
+# ~/.config/prometheus, never in the repo — but guard against a stray copy.
+/phrasebank.json
+/phrasebank-recent.json
+/phrasebank-vetoed.json
+/feedback.jsonl
+/transcript.jsonl
+/journal

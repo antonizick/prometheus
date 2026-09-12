@@ -1,0 +1,1619 @@
+#!/usr/bin/env python3
+"""prometheus-phrasebank — the offline phrase bank (Phase 2, tasks 2.8-2.9).
+
+  prometheus-phrasebank generate [--events a,b] [--variants N] [--if-stale]
+  prometheus-phrasebank pick EVENT [--slot k=v] [--count N] [--dry]
+  prometheus-phrasebank show [EVENT]
+  prometheus-phrasebank add EVENT "text"      write one of your own
+  prometheus-phrasebank veto EVENT "text"     cut one, permanently
+  prometheus-phrasebank verify [--prune]
+  prometheus-phrasebank bench [-n N]
+  prometheus-phrasebank status
+
+ADR-0004 in one sentence: separate *when the words are written* from *when they
+are spoken*. `generate` is the authoring pass — a large local model, persona.md,
+about-me.md and phrasebank-spec.json in, as many validated phrasings per moment
+as that moment honestly carries out, and nobody waiting on any of it.
+
+`pick` is the runtime path — a dictionary lookup and a weighted random choice,
+measured at 9-20 us, with no model loaded and no network involved. Nothing in
+`pick` may ever touch Ollama.
+
+The validator is the component. Small models write the same sentence forty times
+with one word swapped, and they reach for status-report vocabulary ("active",
+"ready", "loaded") the moment they run out of ideas — so every candidate is
+checked for the word ceiling, the required placeholders, banned vocabulary,
+punctuation that cannot be heard, and near-duplication against everything
+already accepted. Rejections are the normal case, not the exception: expect to
+throw away half of what the model writes.
+
+Every candidate, accepted or rejected, is logged with its reason to
+~/.local/state/prometheus/phrasebank.log. That log is the evidence for whether
+the authoring model is earning its place.
+"""
+from __future__ import annotations
+
+import argparse
+import atexit
+import base64
+import difflib
+import hashlib
+import json
+import os
+import random
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+HOME = os.path.expanduser("~")
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+CONFIG_DIR = os.environ.get("PROMETHEUS_CONFIG_DIR") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or f"{HOME}/.config", "prometheus")
+STATE_DIR = os.environ.get("PROMETHEUS_STATE_DIR") or os.path.join(
+    os.environ.get("XDG_STATE_HOME") or f"{HOME}/.local/state", "prometheus")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+BANK_FILE = os.path.join(STATE_DIR, "phrasebank.json")
+RECENT_FILE = os.path.join(STATE_DIR, "phrasebank-recent.json")
+REGEN_STAMP = os.path.join(STATE_DIR, "phrasebank-regen.stamp")
+REGEN_LOCK = os.path.join(STATE_DIR, "phrasebank-regen.lock")
+# Phrasings cut by ear during a listening review. Survives regeneration.
+VETO_FILE = os.path.join(STATE_DIR, "phrasebank-vetoed.json")
+OLLAMA_UNIT = "prometheus-ollama.service"
+
+SPEC_NAME = "phrasebank-spec.json"
+
+DEFAULT_CONFIG = {
+    "log_level": "info",
+    "logging": {"file_enabled": True, "file_level": "debug", "max_bytes": 4194304},
+    "register": "neutral",
+    "identity": {"name": "Prometheus"},
+    "llm": {
+        "authoring_model": "gemma2:9b",
+        "authoring_fallback_model": "qwen3:8b",
+        "keep_alive": "5m",
+        "temperature": 0.7,
+        "host": "127.0.0.1:11434",
+        "server_start_wait_secs": 2.0,
+        # Authoring is not latency-bound (docs/03): nobody is waiting, so this
+        # is generous where the runtime summarizer's 4s is not.
+        "authoring_timeout_secs": 180,
+        "authoring_temperature": 0.95,
+    },
+    "phrasebank": {
+        "variants_per_event": 40,
+        "avoid_last_n": 15,
+        "regenerate_days": 7,
+        # Rounds of generation per event before giving up and banking what we
+        # have. Each round is one model call asking for `batch_size` lines.
+        "max_rounds": 14,
+        "batch_size": 5,
+        "auto_regenerate": True,
+        "auto_regenerate_cooldown_secs": 900,
+    },
+}
+
+REGISTER_NOTES = {
+    "terse": ("terse — the fewest words that carry it, clipped hard. "
+              "Fragments over sentences. Nothing decorative."),
+    "neutral": ("neutral — plain and unforced. Neither clipped telegraphese "
+                "nor chat. The way someone states a fact across a desk."),
+    "warm": ("warm — the same information with a little more give in it. "
+             "Warm is not cheerful and never encouraging; it is just less clipped."),
+}
+
+
+# --------------------------------------------------------------------------
+# config + logging (same shape as bin/prometheusd, bin/prometheus-llm)
+# --------------------------------------------------------------------------
+
+def deep_merge(base: dict, over: dict) -> dict:
+    out = dict(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def strip_jsonc(text: str) -> str:
+    out, in_str, esc, i = [], False, False, 0
+    while i < len(text):
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+            out.append(c)
+        elif c == "/" and i + 1 < len(text) and text[i + 1] == "/":
+            while i < len(text) and text[i] != "\n":
+                i += 1
+            continue
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_FILE) as f:
+            raw = json.loads(strip_jsonc(f.read()))
+    except (OSError, ValueError):
+        return json.loads(json.dumps(DEFAULT_CONFIG))
+    return deep_merge(DEFAULT_CONFIG, raw)
+
+
+LEVELS = {"debug": 0, "info": 1, "warn": 2, "error": 3}
+
+
+class Log:
+    def __init__(self) -> None:
+        self.level = LEVELS["info"]
+        self.file_level = LEVELS["debug"]
+        self.file_path: str | None = os.path.join(STATE_DIR, "phrasebank.log")
+        self.max_bytes = 4 * 1024 * 1024
+        self._lock = threading.Lock()
+
+    def configure(self, cfg: dict) -> None:
+        lg = cfg.get("logging", {})
+        self.level = LEVELS.get(cfg.get("log_level", "info"), LEVELS["info"])
+        self.file_level = LEVELS.get(lg.get("file_level", "debug"), LEVELS["debug"])
+        self.max_bytes = int(lg.get("max_bytes", 4 * 1024 * 1024))
+        self.file_path = (os.path.join(STATE_DIR, "phrasebank.log")
+                          if lg.get("file_enabled", True) else None)
+
+    def emit(self, level: str, event: str, msg: str = "", **fields) -> None:
+        lv = LEVELS[level]
+        now = time.time()
+        if lv >= self.level and sys.stderr.isatty():
+            parts = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+            line = f"{time.strftime('%H:%M:%S', time.localtime(now))} {level.upper():<5} {event}"
+            if msg:
+                line += f": {msg}"
+            if parts:
+                line += "  " + parts
+            print(line, file=sys.stderr)
+        if lv >= self.file_level and self.file_path:
+            rec = {"t": round(now, 3), "level": level, "event": event}
+            if msg:
+                rec["msg"] = msg
+            rec.update({k: v for k, v in fields.items() if v is not None})
+            with self._lock:
+                try:
+                    os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
+                    with open(self.file_path, "a") as f:
+                        f.write(json.dumps(rec, default=str) + "\n")
+                        if f.tell() >= self.max_bytes:
+                            os.replace(self.file_path, self.file_path + ".1")
+                except OSError:
+                    pass
+
+    def debug(self, e, m="", **f): self.emit("debug", e, m, **f)
+    def info(self, e, m="", **f): self.emit("info", e, m, **f)
+    def warn(self, e, m="", **f): self.emit("warn", e, m, **f)
+    def error(self, e, m="", **f): self.emit("error", e, m, **f)
+
+
+LOG = Log()
+
+
+# --------------------------------------------------------------------------
+# spec + persona
+# --------------------------------------------------------------------------
+
+def spec_path() -> str:
+    """Deployed copy wins; the repo copy is the fallback so an uninstalled
+    checkout still works."""
+    deployed = os.path.join(CONFIG_DIR, SPEC_NAME)
+    if os.path.exists(deployed):
+        return deployed
+    return os.path.join(REPO_DIR, "config", SPEC_NAME)
+
+
+def read_text_file(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def load_spec() -> dict:
+    path = spec_path()
+    with open(path) as f:
+        raw = f.read()
+    spec = json.loads(strip_jsonc(raw))
+    spec["_path"] = path
+    spec["_sha"] = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    return spec
+
+
+def event_spec(spec: dict, event_id: str) -> dict | None:
+    for e in spec["events"]:
+        if e["id"] == event_id:
+            return e
+    return None
+
+
+def merged_event(spec: dict, ev: dict) -> dict:
+    d = spec.get("defaults", {})
+    allow = {w.lower() for w in ev.get("allow_words", [])}
+    banned = [w for w in (ev.get("banned_words") or d.get("banned_words", []))
+              if w.lower() not in allow]
+    unknowable = [w for w in (ev.get("unknowable_words") or d.get("unknowable_words", []))
+                  if w.lower() not in allow]
+    banned = banned + [w for w in ev.get("banned_extra", []) if w.lower() not in allow]
+    return {
+        "unknowable_words": unknowable,
+        "imperative_openers": [w for w in d.get("imperative_openers", [])
+                               if w.lower() not in allow],
+        "must_include_any": [w.lower() for w in ev.get("must_include_any", [])],
+        "slot_note": ev.get("slot_note"),
+        "id": ev["id"],
+        "moment": ev["moment"],
+        "slots": ev.get("slots", {}),
+        "max_words": ev.get("max_words", d.get("max_words", 8)),
+        "angles": ev.get("angles") or d.get("angles", []),
+        "target": ev.get("target"),
+        "banned_words": banned,
+        "seeds": ev.get("seeds", []),
+    }
+
+
+def persona_text(cfg: dict) -> tuple[str, str]:
+    """persona.md and about-me.md, with {{name}} resolved.
+
+    docs/08: "From Phase 2 the name is also injected into persona prompts and
+    phrase-bank generation, which is what makes it refer to *itself* by the new
+    name rather than just being labelled with it."
+    """
+    name = (cfg.get("identity") or {}).get("name") or "Prometheus"
+    persona = read_text_file(os.path.join(CONFIG_DIR, "persona.md")).replace("{{name}}", name)
+    about = read_text_file(os.path.join(CONFIG_DIR, "about-me.md")).replace("{{name}}", name)
+    return persona, about
+
+
+def fingerprint(cfg: dict, spec: dict) -> str:
+    """What the bank was written from. Any change here makes it stale."""
+    persona, about = persona_text(cfg)
+    pb = cfg["phrasebank"]
+    material = json.dumps({
+        "persona": hashlib.sha256(persona.encode()).hexdigest(),
+        "about": hashlib.sha256(about.encode()).hexdigest(),
+        "spec": spec["_sha"],
+        "register": cfg.get("register"),
+        "name": (cfg.get("identity") or {}).get("name"),
+        "variants": pb["variants_per_event"],
+    }, sort_keys=True)
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+
+# --------------------------------------------------------------------------
+# validation — the component that actually decides quality
+# --------------------------------------------------------------------------
+
+PLACEHOLDER_RE = re.compile(r"\{([a-z_]+)\}")
+# Characters that cannot be heard, or that mark text written to be read.
+UNSPEAKABLE_RE = re.compile(r"[!?*_#`|<>{}\[\]\\/@^~=+]")
+LEADING_JUNK_RE = re.compile(r'^\s*(?:[-*•]|\d+[.)])\s*')
+VETOED: dict[str, set] = {}
+
+NEAR_DUP_RATIO = 0.86
+# Below this length a similarity ratio stops being meaningful — "three" and
+# "workspace three" score 0.5, "on" and "off" score 0.8, and neither pair is a
+# duplicate. Short phrasings are compared by identity and by token set only.
+NEAR_DUP_MIN_CHARS = 14
+
+BANNED_OPENERS = (
+    "here is", "here's", "here are", "the output", "i have", "i've",
+    "it looks like", "it seems", "as requested", "sure", "okay", "ok",
+)
+
+
+def load_vetoed() -> dict[str, set]:
+    try:
+        with open(VETO_FILE) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return {eid: {normalise(t) for t in texts} for eid, texts in raw.items()}
+
+
+def normalise(text: str) -> str:
+    # A placeholder becomes a token that cannot collide with a real word:
+    # "Workspace {workspace}." and "{workspace}." are two phrasings, not one.
+    text = PLACEHOLDER_RE.sub(lambda m: " slot" + m.group(1) + " ", text.lower())
+    # Apostrophes close up rather than splitting, so "didn't" stays one token
+    # and an anchor like "didn" can match it.
+    text = text.replace("'", "").replace("’", "")
+    text = re.sub(r"[^a-z0-9 ]+", " ", text)
+    return " ".join(text.split())
+
+
+def word_count(text: str) -> int:
+    return len(text.split())
+
+
+def is_near_dup(text: str, existing: list[str]) -> str | None:
+    n = normalise(text)
+    if not n:
+        return "empty"
+    ntokens = set(n.split())
+    for other in existing:
+        o = normalise(other)
+        if n == o:
+            return other
+        if ntokens == set(o.split()):
+            return other
+        if min(len(n), len(o)) < NEAR_DUP_MIN_CHARS:
+            continue
+        if difflib.SequenceMatcher(None, n, o).ratio() >= NEAR_DUP_RATIO:
+            return other
+    return None
+
+
+def clean_candidate(raw: str) -> str:
+    text = LEADING_JUNK_RE.sub("", raw.strip())
+    text = text.strip().strip('"').strip("'").strip()
+    text = text.replace("’", "'").replace("“", "").replace("”", "")
+    return " ".join(text.split())
+
+
+def validate(text: str, ev: dict, accepted: list[str]) -> tuple[bool, str]:
+    """Return (ok, reason). `reason` is logged verbatim, so keep it short."""
+    if not text:
+        return False, "empty"
+    if len(text) > 120:
+        return False, "too_long_chars"
+
+    found = set(PLACEHOLDER_RE.findall(text))
+    required = set(ev["slots"].keys())
+    if found - required:
+        return False, f"unknown_placeholder:{','.join(sorted(found - required))}"
+    for slot in required:
+        n = text.count("{%s}" % slot)
+        if n != 1:
+            return False, f"slot_{slot}_x{n}"
+
+    if UNSPEAKABLE_RE.sub("", PLACEHOLDER_RE.sub("X", text)) != PLACEHOLDER_RE.sub("X", text):
+        return False, "unspeakable_char"
+    if re.search(r"\d", PLACEHOLDER_RE.sub("", text)):
+        return False, "bare_digit"           # numbers arrive through slots
+
+    # The ceiling is about how long this takes to SAY, so it is measured on the
+    # rendered line with the longest values a slot can take — "{duration} later,
+    # it was done" is nine words as a template and eleven as speech.
+    worst = {s: max(vals, key=lambda v: len(v.split()))
+             for s, vals in ev["slots"].items() if vals}
+    wc = word_count(render(text, worst, finish=False))
+    if wc > ev["max_words"]:
+        return False, f"over_ceiling:{wc}>{ev['max_words']}"
+
+    low = " " + normalise(text) + " "
+    for w in ev["banned_words"]:
+        if f" {w.lower()} " in low:
+            return False, f"banned_word:{w}"
+    # The important one: a phrasing that mentions something the system cannot
+    # observe is fiction, however well it reads.
+    for w in ev.get("unknowable_words", []):
+        if f" {w.lower()} " in low:
+            return False, f"invented:{w}"
+    for opener in BANNED_OPENERS:
+        if low.startswith(" " + opener):
+            return False, f"banned_opener:{opener}"
+    first = low.split()[0] if low.split() else ""
+    if first in {w.lower() for w in ev.get("imperative_openers", [])}:
+        return False, f"instruction:{first}"
+
+    # The event's own meaning has to survive. Half a bank of "Something
+    # requires input." is worse than a small bank: the most valuable utterance
+    # in the system stops identifying who is waiting.
+    # Prefix match, so "claude" catches "claude's" and "fail" catches "failed"
+    # without the spec having to enumerate every inflection.
+    must = ev.get("must_include_any") or []
+    if must and not any(tok.startswith(w) for tok in low.split() for w in must):
+        return False, "missing_anchor"
+
+    # A verdict from a listening review outlives the bank it was made against:
+    # a phrasing cut by ear is never re-banked by a later regeneration.
+    if normalise(text) in VETOED.get(ev["id"], ()):
+        return False, "vetoed"
+
+    dup = is_near_dup(text, accepted)
+    if dup:
+        return False, f"near_dup:{dup}"
+
+    # Every slot value is a singular noun phrase ("the build", "Brave"), so a
+    # plural verb after one is always wrong. The model reaches for it often
+    # enough to be worth a rule: "The build have crashed", "The build are
+    # completely broken".
+    for slot in required:
+        if re.search(r"\{%s\}\s+(are|have|were|do|don't|aren't|haven't)\b"
+                     % re.escape(slot), text, re.I):
+            return False, f"plural_verb:{slot}"
+
+    # Must read naturally with every example value, not just the one it was
+    # written against ("Back in the terminal" and "Back in Brave" both).
+    for slot, examples in ev["slots"].items():
+        for val in examples:
+            rendered = render(text, {slot: val}, finish=False)
+            if re.search(r"\b(the|a|an)\s+the\b", rendered, re.I):
+                return False, f"double_article:{val}"
+    return True, "ok"
+
+
+# --------------------------------------------------------------------------
+# render — placeholder substitution for speech
+# --------------------------------------------------------------------------
+
+NUMBER_WORDS = {
+    "0": "zero", "1": "one", "2": "two", "3": "three", "4": "four", "5": "five",
+    "6": "six", "7": "seven", "8": "eight", "9": "nine", "10": "ten",
+    "11": "eleven", "12": "twelve", "13": "thirteen", "14": "fourteen",
+    "15": "fifteen", "16": "sixteen", "17": "seventeen", "18": "eighteen",
+    "19": "nineteen", "20": "twenty",
+}
+
+
+def speakable(value: str) -> str:
+    """A bare workspace id arrives as "3"; spoken, it is "three"."""
+    v = str(value).strip()
+    return NUMBER_WORDS.get(v, v)
+
+
+def render(template: str, slots: dict, finish: bool = True) -> str:
+    text = template
+    for k, v in slots.items():
+        text = text.replace("{%s}" % k, speakable(v))
+    text = " ".join(text.split())
+    if not finish:
+        return text
+    # Capitalise sentence starts — a slot value can land at the beginning
+    # ("the terminal, then." -> "The terminal, then.").
+    out, cap = [], True
+    for ch in text:
+        out.append(ch.upper() if cap and ch.isalpha() else ch)
+        if ch in ".:;":
+            cap = True
+        elif not ch.isspace():
+            # Any non-space character closes the sentence opening, not just a
+            # letter — otherwise "17 minutes elapsed" comes out as
+            # "17 Minutes elapsed", the digit having skipped its turn.
+            cap = False
+    text = "".join(out)
+    if text and text[-1] not in ".:;,":
+        text += "."
+    return text
+
+
+# --------------------------------------------------------------------------
+# ollama — authoring only, on demand, never always-on (docs/07)
+# --------------------------------------------------------------------------
+
+def port_open(host: str, port: int, timeout: float) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_ollama_up(host_port: str, wait_secs: float) -> bool:
+    host, port = host_port.split(":")
+    port = int(port)
+    if port_open(host, port, 0.3):
+        return True
+    LOG.info("ollama.cold_start", "socket not open, starting on demand", unit=OLLAMA_UNIT)
+    try:
+        subprocess.run(["systemctl", "--user", "start", OLLAMA_UNIT],
+                       timeout=max(wait_secs, 10),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        LOG.error("ollama.start_failed", str(e), unit=OLLAMA_UNIT)
+        return False
+    deadline = time.monotonic() + max(wait_secs, 10)
+    while time.monotonic() < deadline:
+        if port_open(host, port, 0.3):
+            return True
+        time.sleep(0.15)
+    LOG.error("ollama.unreachable", "socket never opened after start")
+    return False
+
+
+def installed_models(host_port: str) -> set[str]:
+    try:
+        with urllib.request.urlopen(f"http://{host_port}/api/tags", timeout=5) as r:
+            return {m.get("name", "") for m in json.loads(r.read()).get("models", [])}
+    except (urllib.error.URLError, TimeoutError, socket.timeout, ValueError, OSError):
+        return set()
+
+
+def resolve_model(host_port: str, wanted: str, fallback: str | None) -> str:
+    """docs/03's tag trap, which this project has already been bitten by twice:
+    a model named in config may simply not be pulled. Check before spending
+    fifteen minutes discovering it one call at a time."""
+    have = installed_models(host_port)
+    if not have or wanted in have:
+        return wanted
+    if fallback and fallback in have:
+        LOG.warn("authoring.model_missing", "falling back",
+                 wanted=wanted, using=fallback)
+        return fallback
+    LOG.warn("authoring.model_missing", "not installed and no usable fallback",
+             wanted=wanted, fallback=fallback)
+    return wanted
+
+
+def chat(host_port: str, model: str, prompt: str, num_predict: int,
+         temperature: float, keep_alive: str, timeout_secs: float) -> tuple[str | None, float]:
+    """One authoring call.
+
+    Deliberately a single user message with no system role: gemma2 has no
+    system turn in its chat template, and splitting the instructions across
+    roles measurably weakened constraint-following in Phase 2 probing (the
+    model stopped honouring "mention the app exactly once").
+    """
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "think": False,   # no-op on non-hybrid tags; required on hybrid ones
+        "keep_alive": keep_alive,
+        "options": {
+            "num_predict": num_predict,
+            "temperature": temperature,
+            "top_p": 0.95,
+            "repeat_penalty": 1.15,
+            "repeat_last_n": 512,
+        },
+    }
+    req = urllib.request.Request(
+        f"http://{host_port}/api/chat", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_secs) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, TimeoutError, socket.timeout, ValueError) as e:
+        LOG.error("authoring.call_failed", str(e), model=model)
+        return None, round(time.monotonic() - t0, 2)
+    return (data.get("message") or {}).get("content", ""), round(time.monotonic() - t0, 2)
+
+
+# --------------------------------------------------------------------------
+# the authoring prompt
+# --------------------------------------------------------------------------
+
+def pick_slot_values(ev: dict, rnd: random.Random) -> dict:
+    return {slot: rnd.choice(vals) for slot, vals in ev["slots"].items() if vals}
+
+
+def concrete(template: str, values: dict) -> str:
+    out = template
+    for k, v in values.items():
+        out = out.replace("{%s}" % k, v)
+    return out
+
+
+def placeholderise(text: str, values: dict) -> str:
+    """Turn the concrete example values back into placeholders.
+
+    Generation runs against real names because models write far better English
+    about "Brave" than about "{app}" — measured in Phase 2 probing, where the
+    placeholder form collapsed into "{app} active. / {app} ready. / {app}
+    loaded." within ten lines.
+    """
+    out = text
+    for k, v in sorted(values.items(), key=lambda kv: -len(kv[1])):
+        out = re.sub(re.escape(v), "{%s}" % k, out, flags=re.IGNORECASE)
+    return out
+
+
+def build_prompt(ev: dict, persona: str, about: str, register: str, name: str,
+                 reference: list[str], angle: str, mode: str, n: int,
+                 values: dict) -> str:
+    reg_note = REGISTER_NOTES.get(register, REGISTER_NOTES["neutral"])
+    slot_rule = ""
+    if values:
+        named = " and ".join(f'"{v}"' for v in values.values())
+        slot_rule = (f"\nTHE ONE RULE THAT CANNOT BE BROKEN: every line must contain "
+                     f"{named}, exactly once each. A line missing it is thrown away.\n")
+        if ev.get("slot_note"):
+            slot_rule += f"What that value is: {ev['slot_note']}\n"
+
+    anchor_rule = ""
+    if ev.get("must_include_any"):
+        top = ", ".join(f'"{w}"' for w in ev["must_include_any"][:8])
+        anchor_rule = (f"\n- Every line must carry the point in plain words — one of "
+                       f"{top} or something equally unmistakable. A line that could "
+                       f"be about anything is thrown away.")
+
+    banned = ", ".join(ev["banned_words"][:18])
+    unknowable = ", ".join(ev.get("unknowable_words", [])[:14])
+    ref_block = "\n".join(reference)
+
+    if mode == "rephrase" and reference:
+        ask = (f'Here is one of the lines {name} says at that moment:\n\n'
+               f'    {reference[0]}\n\n'
+               f'Write {n} other ways of saying the same thing, in the same voice. '
+               f'Change the sentence, not one word of it.')
+        ref_block = reference[0]
+    else:
+        ask = (f"Lines {name} already says at that moment:\n\n{ref_block}\n\n"
+               f"Write {n} more, different from those and from each other.")
+
+    return f"""{persona}
+
+{about}
+
+You are writing the lines {name} says out loud at one particular moment. They
+are heard, never read.
+
+THE MOMENT: {ev['moment']}
+
+YOU CANNOT SEE THE SCREEN. The moment above is the whole of what you know.
+You do not know what is in the window, what is being read, typed or clicked,
+what happened before, or what anything contains. Writing "{unknowable.split(', ')[0]}"
+or anything like it is inventing, and an invented line is thrown away even when
+it reads beautifully.
+{slot_rule}
+{ask}
+
+Shape them as {angle}.
+
+Rules:
+- Register: {reg_note}
+- Under {ev['max_words']} words each.
+- Vary the sentence, not the adjective. Two lines that differ by one swapped
+  word are one line, and a failure.
+- Never these words, they are not speech: {banned}.
+- Never these words, you cannot know them: {unknowable}.
+- Never tell him to do anything. No "check", "look", "try", "run", "wait".
+  You are reporting, not helping.{anchor_rule}
+- No exclamation marks, no questions, no emotion, no greetings.
+- No file paths, no code, no numbers.
+
+There may not be {n} honest ways to say this. If you run out, stop — write four
+good lines and stop. Padding the list with invented detail is the one
+unforgivable failure here.
+
+One phrasing per line. No numbering, no quotes, no commentary, nothing else."""
+
+
+# --------------------------------------------------------------------------
+# generate
+# --------------------------------------------------------------------------
+
+def generate_event(ev: dict, cfg: dict, spec: dict, persona: str, about: str,
+                   target: int, use_seeds: bool, rnd: random.Random,
+                   model: str, quiet: bool) -> dict:
+    llm, pb = cfg["llm"], cfg["phrasebank"]
+    register = cfg.get("register", "neutral")
+    name = (cfg.get("identity") or {}).get("name") or "Prometheus"
+
+    accepted: list[dict] = []
+    texts: list[str] = []
+    counters = {"offered": 0, "accepted": 0, "rejected": 0, "calls": 0, "secs": 0.0}
+    reject_reasons: dict[str, int] = {}
+
+    def try_accept(text: str, src: str) -> bool:
+        counters["offered"] += 1
+        ok, reason = validate(text, ev, texts)
+        if not ok:
+            counters["rejected"] += 1
+            key = reason.split(":")[0]
+            reject_reasons[key] = reject_reasons.get(key, 0) + 1
+            LOG.debug("candidate.rejected", text, evt=ev["id"], src=src, reason=reason)
+            return False
+        accepted.append({"t": text, "src": src})
+        texts.append(text)
+        counters["accepted"] += 1
+        LOG.debug("candidate.accepted", text, evt=ev["id"], src=src)
+        return True
+
+    # Seeds first. Under a non-neutral register they are a style reference only
+    # (spec comment): banking them would mean changing `register` audibly
+    # changed nothing for a quarter of the bank.
+    if use_seeds and register == "neutral":
+        for s in ev["seeds"]:
+            try_accept(s, "seed")
+
+    seed_pool = list(ev["seeds"])
+    angles = ev["angles"] or ["a plain statement of the fact"]
+    rounds = 0
+    stall = 0
+
+    while len(accepted) < target and rounds < pb["max_rounds"]:
+        rounds += 1
+        values = pick_slot_values(ev, rnd)
+        angle = angles[(rounds - 1) % len(angles)]
+        mode = "rephrase" if rounds % 4 == 0 else "expand"
+
+        if mode == "rephrase":
+            pool = [a["t"] for a in accepted] or seed_pool
+            reference = [concrete(rnd.choice(pool), values)]
+        else:
+            pool = seed_pool + [a["t"] for a in accepted if a["src"] == "model"]
+            sample = rnd.sample(pool, min(8, len(pool)))
+            reference = [concrete(t, values) for t in sample]
+
+        n = pb["batch_size"]
+        prompt = build_prompt(ev, persona, about, register, name, reference,
+                              angle, mode, n, values)
+        out, secs = chat(llm["host"], model, prompt,
+                         num_predict=60 + n * 24,
+                         temperature=llm["authoring_temperature"],
+                         keep_alive=llm["keep_alive"],
+                         timeout_secs=llm["authoring_timeout_secs"])
+        counters["calls"] += 1
+        counters["secs"] += secs
+        if out is None:
+            LOG.warn("round.failed", "no response", evt=ev["id"], round=rounds)
+            continue
+
+        before = len(accepted)
+        for line in out.splitlines():
+            line = clean_candidate(line)
+            if not line or len(line.split()) > 20:
+                continue
+            try_accept(placeholderise(line, values), "model")
+            if len(accepted) >= target:
+                break
+
+        gained = len(accepted) - before
+        LOG.info("round.done", evt=ev["id"], round=rounds, mode=mode,
+                 angle=angle[:32], gained=gained, have=len(accepted),
+                 target=target, secs=secs)
+        if not quiet:
+            print(f"      round {rounds:>2}  {mode:<8} +{gained:<2} "
+                  f"({len(accepted)}/{target})  {secs:>5.1f}s", file=sys.stderr)
+        stall = stall + 1 if gained == 0 else 0
+        if stall >= 4:
+            LOG.warn("event.stalled", "four rounds with nothing usable",
+                     evt=ev["id"], have=len(accepted))
+            break
+
+    return {
+        "variants": accepted,
+        "stats": {**counters, "rounds": rounds,
+                  "secs": round(counters["secs"], 1),
+                  "reject_reasons": reject_reasons,
+                  "seeds": sum(1 for a in accepted if a["src"] == "seed"),
+                  "model_written": sum(1 for a in accepted if a["src"] == "model")},
+    }
+
+
+def write_json(path: str, obj: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=1, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def cmd_generate(a) -> int:
+    cfg = load_config()
+    LOG.configure(cfg)
+    spec = load_spec()
+    pb = cfg["phrasebank"]
+    llm = cfg["llm"]
+    register = a.register or cfg.get("register", "neutral")
+    cfg["register"] = register
+    fp = fingerprint(cfg, spec)
+
+    if a.if_stale:
+        old = load_bank_raw()
+        if old and old.get("fingerprint") == fp and not bank_expired(old, pb):
+            LOG.info("generate.skipped", "bank is current", fingerprint=fp)
+            if not a.quiet:
+                print("bank is current — nothing to do")
+            return 0
+
+    # One authoring pass at a time. Two would fight over ~5.4 GB of VRAM on an
+    # 8 GB card and race to write the same file — and an auto-regeneration can
+    # be triggered by any `pick` while a manual one is already running.
+    if not a.unlock:
+        if not take_regen_lock():
+            print("another regeneration is already running "
+                  f"({REGEN_LOCK}); delete it if that's wrong", file=sys.stderr)
+            LOG.warn("generate.locked", "another pass holds the lock")
+            return 1
+        a.unlock = True            # main()'s finally releases it
+
+    target = a.variants or pb["variants_per_event"]
+    model = a.model or llm["authoring_model"]
+    persona, about = persona_text(cfg)
+    if not persona:
+        print("no persona.md — refusing to author a bank without one", file=sys.stderr)
+        return 1
+
+    wanted = [e["id"] for e in spec["events"]]
+    if a.events:
+        asked = [x.strip() for x in a.events.split(",") if x.strip()]
+        unknown = [x for x in asked if x not in wanted]
+        if unknown:
+            print(f"unknown event(s): {', '.join(unknown)}", file=sys.stderr)
+            return 2
+        wanted = asked
+
+    if not ensure_ollama_up(llm["host"], llm["server_start_wait_secs"]):
+        print("ollama unreachable — cannot author", file=sys.stderr)
+        LOG.error("generate.aborted", "ollama unreachable")
+        return 1
+
+    model = resolve_model(llm["host"], model, llm.get("authoring_fallback_model"))
+    rnd = random.Random(a.seed)
+    t0 = time.monotonic()
+    LOG.info("generate.start", model=model, register=register, target=target,
+             events=len(wanted), fingerprint=fp)
+    if not a.quiet:
+        print(f"authoring model : {model}")
+        print(f"register        : {register}")
+        print(f"variants/event  : {target}")
+        print(f"events          : {len(wanted)}")
+        print(f"spec            : {spec['_path']}\n")
+
+    events_out, totals = {}, {"accepted": 0, "offered": 0, "calls": 0, "seeds": 0,
+                              "model_written": 0, "short": 0}
+    for eid in wanted:
+        ev = merged_event(spec, event_spec(spec, eid))
+        # An explicit --variants overrides everything; otherwise the spec's own
+        # honest ceiling for this moment wins over the global default.
+        ev_target = a.variants or ev.get("target") or target
+        if not a.quiet:
+            print(f"  {eid}", file=sys.stderr)
+        res = generate_event(ev, cfg, spec, persona, about, ev_target,
+                             not a.no_seeds, rnd, model, a.quiet)
+        events_out[eid] = {
+            "moment": ev["moment"],
+            "slots": sorted(ev["slots"].keys()),
+            "max_words": ev["max_words"],
+            "target": ev_target,
+            "variants": res["variants"],
+            "stats": res["stats"],
+        }
+        st = res["stats"]
+        totals["accepted"] += st["accepted"]
+        totals["offered"] += st["offered"]
+        totals["calls"] += st["calls"]
+        totals["seeds"] += st["seeds"]
+        totals["model_written"] += st["model_written"]
+        if st["accepted"] < ev_target:
+            totals["short"] += 1
+        if not a.quiet:
+            print(f"    -> {st['accepted']}/{ev_target}  "
+                  f"({st['seeds']} seed, {st['model_written']} written)  "
+                  f"{st['secs']}s\n", file=sys.stderr)
+
+    elapsed = round(time.monotonic() - t0, 1)
+    bank = {
+        "version": 1,
+        "generated_at": round(time.time(), 3),
+        "generated_at_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "fingerprint": fp,
+        "inputs": {
+            "register": register,
+            "name": (cfg.get("identity") or {}).get("name"),
+            "authoring_model": model,
+            "variants_per_event": target,
+            "spec": spec["_path"],
+            "spec_sha": spec["_sha"],
+            "seeds_banked": (not a.no_seeds) and register == "neutral",
+        },
+        "stats": {**totals, "elapsed_secs": elapsed},
+        "events": events_out,
+    }
+
+    if a.dry_run:
+        json.dump(bank, sys.stdout, indent=1, ensure_ascii=False)
+        print()
+        return 0
+
+    # A partial regeneration keeps the events it didn't touch, so
+    # `--events app_opened` is a top-up rather than a truncation.
+    if a.events:
+        old = load_bank_raw()
+        if old and old.get("events"):
+            merged = dict(old["events"])
+            merged.update(events_out)
+            bank["events"] = merged
+            bank["stats"]["partial"] = wanted
+            # The counters above only saw the events this run touched; the
+            # bank's headline totals have to describe the whole bank.
+            allv = [v for e in merged.values() for v in e["variants"]]
+            bank["stats"].update(
+                accepted=len(allv),
+                seeds=sum(1 for v in allv if v["src"] == "seed"),
+                model_written=sum(1 for v in allv if v["src"] == "model"))
+
+    write_json(BANK_FILE, bank)
+    try:
+        with open(REGEN_STAMP, "w") as f:
+            f.write(str(time.time()))
+    except OSError:
+        pass
+
+    LOG.info("generate.done", accepted=totals["accepted"], offered=totals["offered"],
+             calls=totals["calls"], short_events=totals["short"],
+             elapsed_secs=elapsed, model=model, fingerprint=fp)
+    if not a.quiet:
+        yield_pct = (100.0 * totals["accepted"] / totals["offered"]) if totals["offered"] else 0
+        print("-" * 66)
+        print(f"{totals['accepted']} phrasings across {len(wanted)} events "
+              f"({totals['seeds']} seed, {totals['model_written']} written)")
+        print(f"{totals['calls']} model calls, {yield_pct:.0f}% of candidates survived "
+              f"validation, {elapsed}s total")
+        if totals["short"]:
+            print(f"{totals['short']} event(s) stopped short of their target — "
+                  f"`prometheus-phrasebank show` marks which. That is the "
+                  f"stall guard working, not a failure.")
+        print(f"written to {BANK_FILE}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# runtime: load, pick, mark  (no model, no network, no I/O beyond two files)
+# --------------------------------------------------------------------------
+
+def load_bank_raw() -> dict | None:
+    try:
+        with open(BANK_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def bank_expired(bank: dict, pb: dict) -> bool:
+    days = pb.get("regenerate_days", 0)
+    if not days:
+        return False
+    return (time.time() - bank.get("generated_at", 0)) > days * 86400
+
+
+def vhash(text: str) -> str:
+    return base64.b32encode(hashlib.sha1(text.encode()).digest()[:5]).decode().rstrip("=")
+
+
+class Bank:
+    """The runtime path. Hold one of these; never construct it per event."""
+
+    def __init__(self, bank: dict, avoid_last_n: int = 15, state_path: str = RECENT_FILE):
+        self.bank = bank
+        self.avoid_last_n = avoid_last_n
+        self.state_path = state_path
+        self.state = self._load_state()
+        self._rnd = random.Random()
+        self._dirty = False
+        self._last_write = 0.0
+        self._hashed: dict[str, list[tuple[dict, str]]] = {}
+        atexit.register(self.flush)
+
+    @classmethod
+    def open(cls, cfg: dict | None = None) -> "Bank | None":
+        cfg = cfg or load_config()
+        raw = load_bank_raw()
+        if not raw:
+            return None
+        return cls(raw, cfg["phrasebank"]["avoid_last_n"])
+
+    def _load_state(self) -> dict:
+        try:
+            with open(self.state_path) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    # Which phrasings have been used recently is the one piece of state the
+    # picker keeps, and writing it is ~100x the cost of the pick itself. It is
+    # coalesced rather than written per pick: real events are seconds apart, so
+    # this still persists effectively every time, and the worst case of losing
+    # it is hearing one phrasing sooner than the avoid window intended.
+    STATE_WRITE_INTERVAL_SECS = 0.5
+
+    def flush(self) -> None:
+        if self._dirty:
+            self._save_state()
+            self._dirty = False
+            self._last_write = time.monotonic()
+
+    def _mark_dirty(self) -> None:
+        self._dirty = True
+        if time.monotonic() - self._last_write >= self.STATE_WRITE_INTERVAL_SECS:
+            self.flush()
+
+    def _save_state(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+            tmp = self.state_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.state, f)
+            os.replace(tmp, self.state_path)
+        except OSError:
+            pass
+
+    def events(self) -> list[str]:
+        return list(self.bank.get("events", {}).keys())
+
+    def pick(self, event: str, slots: dict | None = None, mark: bool = True) -> str | None:
+        """Weighted pick excluding the last `avoid_last_n` used (docs/08).
+
+        Weight is 1/(1+times used), so the bank fans out across everything it
+        has before coming back round, and a phrasing heard once is less likely
+        than one never heard at all.
+        """
+        ev = self.bank.get("events", {}).get(event)
+        if not ev or not ev.get("variants"):
+            return None
+        st = self.state.setdefault(event, {"recent": [], "uses": {}})
+        recent = set(st["recent"][-self.avoid_last_n:])
+        # Hashes are computed once per bank, not once per pick: hashing thirty
+        # variants on every window focus is most of what the lookup would cost.
+        hashed = self._hashed.get(event)
+        if hashed is None:
+            hashed = self._hashed[event] = [(v, vhash(v["t"])) for v in ev["variants"]]
+
+        pool = [vh for vh in hashed if vh[1] not in recent]
+        if not pool:                      # bank smaller than the avoid window
+            pool = hashed
+        weights = [1.0 / (1.0 + st["uses"].get(h, 0)) for _, h in pool]
+        chosen, chosen_hash = self._rnd.choices(pool, weights=weights, k=1)[0]
+
+        if mark:
+            h = chosen_hash
+            st["recent"].append(h)
+            if len(st["recent"]) > self.avoid_last_n * 2:
+                del st["recent"][:-self.avoid_last_n]
+            st["uses"][h] = st["uses"].get(h, 0) + 1
+            self._mark_dirty()
+        return render(chosen["t"], slots or {})
+
+    def stale(self, cfg: dict, spec: dict) -> bool:
+        return self.bank.get("fingerprint") != fingerprint(cfg, spec)
+
+
+REGEN_LOCK_STALE_SECS = 3600
+
+
+def take_regen_lock() -> bool:
+    """Exclusive create, with a stale-lock escape so a killed run can't wedge
+    regeneration forever."""
+    try:
+        fd = os.open(REGEN_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        try:
+            age = time.time() - os.path.getmtime(REGEN_LOCK)
+        except OSError:
+            return False
+        if age < REGEN_LOCK_STALE_SECS:
+            return False
+        LOG.warn("lock.stale", "removing an abandoned lock", age_secs=round(age))
+        try:
+            os.unlink(REGEN_LOCK)
+        except OSError:
+            return False
+        return take_regen_lock()
+    except OSError:
+        return False
+
+
+def maybe_auto_regenerate(cfg: dict, spec: dict, reason: str) -> bool:
+    """ADR-0004: regenerate automatically when persona, about-me or register
+    changes. Detached and rate-limited — the point of the bank is that nothing
+    at event time ever waits on a model, and that includes this."""
+    pb = cfg["phrasebank"]
+    if not pb.get("auto_regenerate", True):
+        return False
+    if os.environ.get("PROMETHEUS_NO_AUTOREGEN"):
+        return False
+    try:
+        last = os.path.getmtime(REGEN_STAMP)
+    except OSError:
+        last = 0
+    if time.time() - last < pb.get("auto_regenerate_cooldown_secs", 900):
+        LOG.debug("autoregen.cooldown", reason=reason)
+        return False
+    if not take_regen_lock():
+        LOG.debug("autoregen.locked", reason=reason)
+        return False
+    try:
+        with open(REGEN_STAMP, "w") as f:
+            f.write(str(time.time()))
+    except OSError:
+        pass
+    LOG.info("autoregen.spawned", reason=reason)
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.realpath(__file__), "generate", "--quiet", "--unlock"],
+            start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        LOG.error("autoregen.spawn_failed", str(e))
+        try:
+            os.unlink(REGEN_LOCK)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def cmd_pick(a) -> int:
+    cfg = load_config()
+    LOG.configure(cfg)
+    slots = {}
+    for kv in a.slot or []:
+        if "=" not in kv:
+            print(f"bad --slot {kv!r}, want key=value", file=sys.stderr)
+            return 2
+        k, v = kv.split("=", 1)
+        slots[k] = v
+
+    bank = Bank.open(cfg)
+    if bank is None:
+        LOG.warn("pick.no_bank", "no phrasebank — run: prometheus regenerate")
+        return 1
+
+    try:
+        spec = load_spec()
+        if bank.stale(cfg, spec):
+            LOG.warn("pick.stale", "bank no longer matches persona/register/spec")
+            maybe_auto_regenerate(cfg, spec, "fingerprint_changed")
+    except (OSError, ValueError):
+        pass
+
+    for _ in range(a.count):
+        line = bank.pick(a.event, slots, mark=not a.dry)
+        if line is None:
+            LOG.warn("pick.unknown_event", evt=a.event)
+            return 1
+        LOG.debug("pick.ok", line, evt=a.event)
+        print(line)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# inspection
+# --------------------------------------------------------------------------
+
+def cmd_show(a) -> int:
+    cfg = load_config()
+    bank = load_bank_raw()
+    if not bank:
+        print("no phrasebank yet — run: prometheus regenerate", file=sys.stderr)
+        return 1
+    if a.json:
+        json.dump(bank, sys.stdout, indent=1, ensure_ascii=False)
+        print()
+        return 0
+
+    inputs, stats = bank["inputs"], bank.get("stats", {})
+    print(f"written   : {bank['generated_at_iso']}   ({inputs['authoring_model']})")
+    print(f"register  : {inputs['register']}    name: {inputs['name']}    "
+          f"fingerprint: {bank['fingerprint']}")
+    print(f"totals    : {stats.get('accepted', 0)} phrasings, "
+          f"{stats.get('seeds', 0)} seed / {stats.get('model_written', 0)} written, "
+          f"{stats.get('elapsed_secs', '?')}s\n")
+
+    default_target = inputs.get("variants_per_event", 40)
+    events = bank["events"]
+    ids = [a.event] if a.event else list(events)
+    for eid in ids:
+        ev = events.get(eid)
+        if not ev:
+            print(f"unknown event {eid}", file=sys.stderr)
+            return 1
+        st = ev.get("stats", {})
+        tgt = ev.get("target", default_target)
+        flag = "" if len(ev["variants"]) >= tgt else "   ** short **"
+        print(f"{eid}  [{len(ev['variants'])}/{tgt}]"
+              f"  {st.get('seeds', 0)} seed / {st.get('model_written', 0)} written{flag}")
+        if a.event or a.all:
+            example = {s: {"app": "Brave", "workspace": "3", "command": "the build",
+                           "duration": "forty seconds", "project": "Prometheus",
+                           "percent": "ten percent", "span": "fifteen minutes"}.get(s, s)
+                       for s in ev["slots"]}
+            for v in ev["variants"]:
+                print(f"    {'·' if v['src'] == 'model' else '*'} {render(v['t'], example)}")
+            if st.get("reject_reasons"):
+                worst = sorted(st["reject_reasons"].items(), key=lambda kv: -kv[1])[:6]
+                print("    rejected: " + ", ".join(f"{k} x{n}" for k, n in worst))
+            print()
+    if not a.event and not a.all:
+        print("\n(`show EVENT` or `show --all` to read the phrasings; "
+              "* = hand-written seed, · = model-written)")
+    return 0
+
+
+def spec_add_seed(raw: str, eid: str, phrase: str) -> str:
+    """Insert a phrasing into an event's `seeds` array, in the file's own text.
+
+    A text edit rather than a parse-and-rewrite, for the same reason
+    `prometheus voice` edits config.json that way: the spec carries the
+    comments that explain it, and json.dump would throw every one of them away.
+    """
+    i = raw.index('"id": "%s"' % eid)
+    j = raw.index('"seeds": [', i)
+    k = raw.index("]", j)
+    head = raw[:k]
+    stripped = head.rstrip()
+    trailing_ws = head[len(stripped):]          # the newline + indent before ]
+    indent = "        "
+    m = re.search(r"\n(\s+)\"", raw[j:k])
+    if m:
+        indent = m.group(1)
+    return stripped + ",\n" + indent + json.dumps(phrase, ensure_ascii=False) \
+        + trailing_ws + raw[k:]
+
+
+def cmd_add(a) -> int:
+    """Write a phrasing of your own into the spec, permanently.
+
+    This is the durable half of the review loop. `veto` takes a line out;
+    `add` puts one in — and puts it in `phrasebank-spec.json`, not in the
+    generated bank, so a later `prometheus regenerate` keeps it instead of
+    overwriting it. It is also banked immediately, so you hear it now.
+    """
+    cfg = load_config()
+    LOG.configure(cfg)
+    spec = load_spec()
+    es = event_spec(spec, a.event)
+    if not es:
+        print(f"unknown event {a.event} — `prometheus phrase --show` lists them",
+              file=sys.stderr)
+        return 1
+    ev = merged_event(spec, es)
+    phrase = clean_candidate(a.text)
+
+    bank = load_bank_raw()
+    existing = [v["t"] for v in bank["events"].get(a.event, {}).get("variants", [])] \
+        if bank else []
+    ok, reason = validate(phrase, ev, existing)
+    if not ok and not a.force:
+        print(f"the validator objects: {reason}", file=sys.stderr)
+        if reason == "vetoed":
+            print("  (you cut this line before — --force adds it back and "
+                  "clears the veto)", file=sys.stderr)
+        else:
+            print("  your ear beats the validator: pass --force to add it anyway",
+                  file=sys.stderr)
+        LOG.info("add.rejected", phrase, evt=a.event, reason=reason)
+        return 1
+
+    # Clear any veto on it, or the next regeneration would drop it again.
+    try:
+        with open(VETO_FILE) as f:
+            vetoed = json.load(f)
+    except (OSError, ValueError):
+        vetoed = {}
+    if a.event in vetoed:
+        before = len(vetoed[a.event])
+        vetoed[a.event] = [t for t in vetoed[a.event]
+                           if normalise(t) != normalise(phrase)]
+        if len(vetoed[a.event]) != before:
+            write_json(VETO_FILE, vetoed)
+            print("cleared the earlier veto on this line")
+
+    path = spec_path()
+    with open(path) as f:
+        raw = f.read()
+    try:
+        updated = spec_add_seed(raw, a.event, phrase)
+        json.loads(strip_jsonc(updated))          # never write a broken spec
+    except (ValueError, KeyError) as e:
+        print(f"could not edit {path}: {e}", file=sys.stderr)
+        return 1
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(updated)
+    os.replace(tmp, path)
+    print(f"added to {path}")
+
+    if bank and a.event in bank["events"]:
+        bank["events"][a.event]["variants"].append({"t": phrase, "src": "seed"})
+        allv = [v for e in bank["events"].values() for v in e["variants"]]
+        bank["stats"].update(
+            accepted=len(allv),
+            seeds=sum(1 for v in allv if v["src"] == "seed"),
+            model_written=sum(1 for v in allv if v["src"] == "model"))
+        # The spec just changed, and so did the bank, in the same way — so the
+        # bank is still current. Re-stamp it, or one added line would mark the
+        # whole bank stale and trigger a needless regeneration.
+        bank["fingerprint"] = fingerprint(cfg, load_spec())
+        write_json(BANK_FILE, bank)
+        print(f"{a.event} now has {len(bank['events'][a.event]['variants'])} phrasings")
+
+    example = {s: (vals[0] if vals else s) for s, vals in ev["slots"].items()}
+    print(f"you'll hear it as: {render(phrase, example)}")
+    LOG.info("add.ok", phrase, evt=a.event, forced=a.force or None)
+    return 0
+
+
+def cmd_veto(a) -> int:
+    """Cut a phrasing by ear, permanently.
+
+    This is what makes the listening review (task 2.10) mean something: a line
+    that sounds wrong is removed from the bank now AND recorded, so the next
+    regeneration cannot quietly bring it back. docs/06's "cut anything that
+    sounds long, chirpy, repetitive, or unclear", with somewhere to put the
+    verdict.
+    """
+    cfg = load_config()
+    LOG.configure(cfg)
+    bank = load_bank_raw()
+    if not bank:
+        print("no phrasebank yet", file=sys.stderr)
+        return 1
+    ev = bank["events"].get(a.event)
+    if not ev:
+        print(f"unknown event {a.event}", file=sys.stderr)
+        return 1
+
+    # Match against the template AND against the rendered forms, because what
+    # was heard during a review was "all the build good", never
+    # "all the {command} good".
+    needle = " ".join(a.text.split()).lower()
+    try:
+        es = merged_event(load_spec(), event_spec(load_spec(), a.event)) or {}
+    except (OSError, ValueError):
+        es = {}
+    renderings = [{s: s for s in ev["slots"]}]
+    for slot, examples in (es.get("slots") or {}).items():
+        for val in examples:
+            renderings.append({**renderings[0], slot: val})
+
+    def matches(v: dict) -> bool:
+        if needle in v["t"].lower():
+            return True
+        return any(needle in render(v["t"], r).lower() for r in renderings)
+
+    hits = [v for v in ev["variants"] if matches(v)]
+    if not hits:
+        print(f"nothing in {a.event} matches {a.text!r}", file=sys.stderr)
+        return 1
+    if len(hits) > 1 and not a.all:
+        print(f"{len(hits)} phrasings match — be more specific, or pass --all:",
+              file=sys.stderr)
+        for v in hits:
+            print(f"    {v['t']}", file=sys.stderr)
+        return 1
+
+    try:
+        with open(VETO_FILE) as f:
+            vetoed = json.load(f)
+    except (OSError, ValueError):
+        vetoed = {}
+    vetoed.setdefault(a.event, [])
+    for v in hits:
+        if v["t"] not in vetoed[a.event]:
+            vetoed[a.event].append(v["t"])
+        print(f"cut: {v['t']}")
+        LOG.info("veto.added", v["t"], evt=a.event, src=v["src"])
+    write_json(VETO_FILE, vetoed)
+
+    ev["variants"] = [v for v in ev["variants"] if v not in hits]
+    ev.setdefault("stats", {})["vetoed"] = ev["stats"].get("vetoed", 0) + len(hits)
+    bank["stats"]["accepted"] = sum(len(e["variants"]) for e in bank["events"].values())
+    write_json(BANK_FILE, bank)
+    print(f"{a.event} now has {len(ev['variants'])} phrasings "
+          f"(target {ev.get('target', '?')})")
+    print("`prometheus regenerate --events %s` tops it back up; the cut line "
+          "will not come back." % a.event)
+    return 0
+
+
+def cmd_verify(a) -> int:
+    """Re-run the validator over a written bank. Catches a bank authored by an
+    older spec, and proves the acceptance criteria rather than asserting them."""
+    cfg = load_config()
+    LOG.configure(cfg)
+    spec = load_spec()
+    bank = load_bank_raw()
+    if not bank:
+        print("no phrasebank yet", file=sys.stderr)
+        return 1
+
+    default_target = bank["inputs"].get("variants_per_event", 40)
+    problems, shortfalls, checked = [], [], 0
+    pruned = 0
+    for eid, ev_bank in bank["events"].items():
+        es = event_spec(spec, eid)
+        if not es:
+            problems.append(f"{eid}: in the bank but not in the spec")
+            continue
+        ev = merged_event(spec, es)
+        seen: list[str] = []
+        keep = []
+        for v in ev_bank["variants"]:
+            checked += 1
+            ok, reason = validate(v["t"], ev, seen)
+            if not ok:
+                problems.append(f"{eid}: {v['t']!r} -> {reason}")
+                LOG.info("verify.invalid", v["t"], evt=eid, reason=reason)
+                if a.prune:
+                    pruned += 1
+                    seen.append(v["t"])
+                    continue
+            keep.append(v)
+            seen.append(v["t"])
+        if a.prune:
+            ev_bank["variants"] = keep
+        tgt = ev_bank.get("target", default_target)
+        if len(ev_bank["variants"]) < tgt:
+            # Not a failure. The authoring pass stops when a moment stops
+            # yielding anything usable, which is the behaviour we want — a
+            # bank one phrasing short beats a bank with one invented line in it.
+            shortfalls.append(f"{eid}: {len(ev_bank['variants'])} of {tgt}")
+    for es in spec["events"]:
+        if es["id"] not in bank["events"]:
+            problems.append(f"{es['id']}: in the spec but not in the bank")
+
+    fp_now = fingerprint(cfg, spec)
+    if bank["fingerprint"] != fp_now:
+        problems.append(f"stale: bank {bank['fingerprint']} != current {fp_now}")
+
+    if a.prune and pruned:
+        bank["stats"]["accepted"] = sum(len(e["variants"]) for e in bank["events"].values())
+        write_json(BANK_FILE, bank)
+
+    print(f"checked {checked} phrasings across {len(bank['events'])} events")
+    if a.prune:
+        print(f"pruned {pruned}")
+    for p in problems:
+        print(f"  FAIL  {p}")
+    for s in shortfalls:
+        print(f"  short {s}")
+    print("ok" if not problems else f"{len(problems)} problem(s)")
+    LOG.info("verify.done", checked=checked, problems=len(problems),
+             shortfalls=len(shortfalls))
+    return 0 if not problems else 1
+
+
+def cmd_bench(a) -> int:
+    """Acceptance criterion: "runtime bank lookup adds no measurable latency and
+    loads no model". Measures the in-process path a narrator would use."""
+    cfg = load_config()
+    bank = Bank.open(cfg)
+    if bank is None:
+        print("no phrasebank yet", file=sys.stderr)
+        return 1
+    events = bank.events()
+    slots = {"app": "Brave", "workspace": "3", "command": "the build",
+             "duration": "forty seconds", "project": "Prometheus",
+             "percent": "ten percent", "span": "fifteen minutes"}
+
+    t0 = time.perf_counter()
+    b2 = Bank.open(cfg)
+    load_ms = (time.perf_counter() - t0) * 1000
+
+    samples = []
+    for i in range(a.n):
+        ev = events[i % len(events)]
+        t = time.perf_counter()
+        b2.pick(ev, slots, mark=not a.no_mark)
+        samples.append((time.perf_counter() - t) * 1e6)
+    samples.sort()
+    p = lambda q: samples[min(len(samples) - 1, int(len(samples) * q))]
+    print(f"bank load (once)     : {load_ms:.1f} ms")
+    print(f"pick, n={a.n:<6}       : p50 {p(0.5):.0f} us   p95 {p(0.95):.0f} us   "
+          f"max {samples[-1]:.0f} us")
+    print(f"marking used         : "
+          f"{'on (state writes coalesced to 2/s)' if not a.no_mark else 'off'}")
+    host = cfg["llm"]["host"]
+    h, prt = host.split(":")
+    print(f"ollama reachable now : {port_open(h, int(prt), 0.2)}  "
+          f"(irrelevant — pick never contacts it)")
+    return 0
+
+
+def cmd_status(a) -> int:
+    cfg = load_config()
+    spec = load_spec()
+    bank = load_bank_raw()
+    fp = fingerprint(cfg, spec)
+    print(f"spec        : {spec['_path']}  ({spec['_sha']})")
+    print(f"current fp  : {fp}")
+    if not bank:
+        print("bank        : MISSING — run `prometheus regenerate`")
+        return 1
+    age_days = (time.time() - bank.get("generated_at", 0)) / 86400
+    print(f"bank        : {BANK_FILE}")
+    print(f"written     : {bank['generated_at_iso']}  ({age_days:.1f} days ago)")
+    print(f"bank fp     : {bank['fingerprint']}")
+    stale = bank["fingerprint"] != fp
+    print(f"state       : {'STALE — persona, register or spec changed' if stale else 'current'}"
+          + ("  / past regenerate_days" if bank_expired(bank, cfg["phrasebank"]) else ""))
+    print(f"phrasings   : {bank.get('stats', {}).get('accepted', 0)}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="prometheus-phrasebank", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    g = sub.add_parser("generate", help="author the phrase bank (offline, uses the GPU)")
+    g.add_argument("--events", default=None, help="comma-separated subset")
+    g.add_argument("--variants", type=int, default=None)
+    g.add_argument("--register", default=None, choices=["terse", "neutral", "warm"])
+    g.add_argument("--model", default=None, help="override the authoring model")
+    g.add_argument("--no-seeds", action="store_true",
+                   help="bank only what the model writes — hear it unaided")
+    g.add_argument("--if-stale", action="store_true",
+                   help="do nothing unless the bank no longer matches its inputs")
+    g.add_argument("--dry-run", action="store_true", help="print the bank, don't write it")
+    g.add_argument("--seed", type=int, default=None, help="RNG seed, for reproducibility")
+    g.add_argument("-q", "--quiet", action="store_true")
+    g.add_argument("--unlock", action="store_true", help=argparse.SUPPRESS)
+    g.set_defaults(func=cmd_generate)
+
+    k = sub.add_parser("pick", help="one phrasing for an event (the runtime path)")
+    k.add_argument("event")
+    k.add_argument("--slot", action="append", metavar="K=V")
+    k.add_argument("-n", "--count", type=int, default=1)
+    k.add_argument("--dry", action="store_true", help="don't record it as used")
+    k.set_defaults(func=cmd_pick)
+
+    s = sub.add_parser("show", help="what's in the bank")
+    s.add_argument("event", nargs="?")
+    s.add_argument("--all", action="store_true", help="print every phrasing")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_show)
+
+    v = sub.add_parser("verify", help="re-validate a written bank against the spec")
+    v.add_argument("--prune", action="store_true",
+                   help="drop anything that no longer validates, so a rule "
+                        "change doesn't need a full regeneration")
+    v.set_defaults(func=cmd_verify)
+
+    ad = sub.add_parser("add", help="write a phrasing of your own — permanently")
+    ad.add_argument("event")
+    ad.add_argument("text", help="the phrasing, with {slots} where values go")
+    ad.add_argument("--force", action="store_true",
+                    help="add it even if the validator objects — your ear wins")
+    ad.set_defaults(func=cmd_add)
+
+    vt = sub.add_parser("veto", help="cut a phrasing by ear — permanently")
+    vt.add_argument("event")
+    vt.add_argument("text", help="the phrasing, or enough of it to be unambiguous")
+    vt.add_argument("--all", action="store_true", help="cut every match")
+    vt.set_defaults(func=cmd_veto)
+
+    b = sub.add_parser("bench", help="measure the runtime lookup path")
+    b.add_argument("-n", type=int, default=2000)
+    b.add_argument("--no-mark", action="store_true")
+    b.set_defaults(func=cmd_bench)
+
+    st = sub.add_parser("status", help="is the bank current?")
+    st.set_defaults(func=cmd_status)
+
+    a = p.parse_args()
+    global VETOED
+    VETOED = load_vetoed()
+    try:
+        return a.func(a)
+    finally:
+        if getattr(a, "unlock", False):
+            try:
+                os.unlink(REGEN_LOCK)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())

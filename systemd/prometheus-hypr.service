@@ -1,0 +1,19 @@
+[Unit]
+Description=Prometheus Hyprland event journal
+Documentation=file:%h/Work/prometheus/docs/04-build-plan.md
+PartOf=prometheus.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/Work/prometheus/bin/prometheus-hypr
+Restart=on-failure
+RestartSec=2
+# Never let the voice layer compete with real work for CPU.
+Nice=5
+IOSchedulingClass=idle
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=prometheus.target

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Oneshot, run at login by prometheus-boot.service. Reads the persisted toggle
+# state and starts the unit tree only if it says on, then exits. Nothing of
+# ours stays resident when Prometheus is off.
+set -u
+state_file="${XDG_STATE_HOME:-$HOME/.local/state}/prometheus/enabled"
+[[ -r "$state_file" ]] || exit 0
+[[ "$(<"$state_file")" == "1" ]] || exit 0
+exec systemctl --user start prometheus.target

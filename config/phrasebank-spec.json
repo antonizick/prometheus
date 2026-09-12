@@ -1,0 +1,420 @@
+{
+  // The phrase-bank specification (docs/08, ADR-0004).
+  //
+  // This file says WHAT the system has occasion to say. persona.md says HOW it
+  // says it. `prometheus regenerate` combines the two and writes ~40 phrasings
+  // per moment into ~/.local/state/prometheus/phrasebank.json; at runtime a
+  // phrasing is a dictionary lookup and a weighted pick, with no model loaded.
+  //
+  // `seeds` are hand-written in the NEUTRAL register. They do two jobs:
+  //   1. they are the few-shot examples that show the authoring model the voice
+  //   2. when `register` is "neutral" they are also banked directly, which is
+  //      what guarantees the bank has a quality floor even if a regeneration
+  //      produces nothing usable.
+  // Under "terse" or "warm" the seeds are shown to the model as a reference but
+  // are NOT banked, so the register genuinely changes what you hear.
+  //
+  // `slots` are the placeholders a phrasing may contain. Each lists example
+  // values: generation is done with a real value substituted in (models write
+  // far better English about "Brave" than about "{app}") and the value is
+  // turned back into a placeholder afterwards. Every example value is also used
+  // to check the phrasing still reads naturally once rendered.
+  //
+  // `target` is how many phrasings a moment can honestly carry. It is NOT the
+  // same number for every event, and forcing one number on all of them is what
+  // makes a bank sound wrong: told only that an application came to the
+  // foreground, there are perhaps twenty true things to say and no more, and a
+  // model asked for forty will invent the other twenty. A command failing
+  // supports far more, because failure has more shades. config.json's
+  // `variants_per_event` is the fallback for events that name no target.
+  //
+  // Editing this file changes the fingerprint and marks the bank stale.
+  "version": 1,
+
+  "defaults": {
+    "max_words": 8,
+
+    // Vocabulary no one says out loud. A candidate containing any of these is
+    // rejected — this is the single most effective filter, because it is
+    // exactly where small models go when they run out of ideas.
+    "banned_words": [
+      "active", "ready", "loaded", "engaged", "available", "displayed",
+      "responding", "online", "restored", "resumed", "surfaced", "visible",
+      "focused", "initialised", "initialized", "status", "successfully",
+      "please", "sorry", "oops", "great", "awesome", "unfortunately",
+      "he", "him", "his", "user", "nick"
+    ],
+
+    // Things the system cannot possibly know. This is the failure the
+    // validator exists for, and the one no amount of prompting prevents on its
+    // own: told only that an application came to the foreground, a model will
+    // happily write "scrolling through Brave's tabs" or "the cursor blinks in
+    // Brave's text field". It cannot see the screen. A phrasing containing any
+    // of these is invented, and invented detail is worse than silence.
+    // Events that legitimately need one of these words list it in
+    // `allow_words` — monitor_connected really does know about a display.
+    "unknowable_words": [
+      "tab", "tabs", "link", "links", "cursor", "article", "bookmark",
+      "bookmarks", "sidebar", "feed", "message", "messages", "chat", "chats",
+      "notification", "notifications", "window", "windows", "page", "pages",
+      "document", "email", "video", "song", "playlist", "download", "upload",
+      "channel", "channels", "folder", "screen", "display", "monitor",
+      "typing", "scrolling", "clicking", "reading", "editing", "writing",
+      "content", "text", "looks", "seems", "guess", "maybe", "probably",
+      "i", "something", "somewhere", "system", "network", "hardware",
+      "cpu", "memory", "disk", "instance", "instructions", "console",
+      "log", "logs", "output", "results", "minute", "minutes", "hour",
+      "hours", "clock", "things", "background"
+    ],
+
+    // Lines that tell him to do something. He did not ask for help and is not
+    // getting any: "Check the build log." is not a thing this system says, at
+    // any register. Caught by the opening word, bare and gerund both, because
+    // that is where an instruction always announces itself.
+    "imperative_openers": [
+      "try", "trying", "check", "checking", "look", "looking", "see",
+      "seeing", "run", "running", "wait", "waiting", "fix", "fixing",
+      "verify", "ensure", "review", "reviewing", "consider", "remember",
+      "note", "watch", "watching", "keep", "keeping", "let", "give",
+      "put", "get", "find", "make", "take", "go", "open", "opening",
+      "close", "read", "reading", "use", "using", "please"
+    ],
+
+    // Construction directives, rotated across generation rounds. Variety comes
+    // from here rather than from sampling temperature — asking a small model
+    // for "40 different lines" reliably produces one line forty times.
+    "angles": [
+      "a bare fragment of two or three words",
+      "a complete sentence with a verb in it",
+      "a line that starts with something other than the name",
+      "an aside, as if noticed in passing and only half-interesting",
+      "as flat and plain as it can possibly be said",
+      "a line where the last word is the one that matters"
+    ]
+  },
+
+  "events": [
+    {
+      "id": "app_opened",
+      "target": 16,
+      "moment": "An application has just been launched. It was not running before.",
+      "slots": { "app": ["Brave", "Obsidian", "Discord", "Claude Code"] },
+      "max_words": 7,
+      "seeds": [
+        "{app}.",
+        "{app}, then.",
+        "{app}'s up.",
+        "And {app}.",
+        "Starting {app}.",
+        "There goes {app}.",
+        "{app} it is.",
+        "Off we go — {app}."
+      ]
+    },
+    {
+      "id": "app_returned",
+      "target": 20,
+      "moment": "An application has come back to the foreground after a stretch of time spent in other windows.",
+      "slots": { "app": ["Brave", "Obsidian", "Discord", "Claude Code"] },
+      "max_words": 8,
+      "seeds": [
+        "Back in {app}.",
+        "{app} again.",
+        "Been a while since {app}.",
+        "Straight back to {app}, then.",
+        "{app} once more.",
+        "Returning to {app}.",
+        "{app}, where we left off.",
+        "{app}, picking that back up."
+      ]
+    },
+    {
+      "id": "app_first_today",
+      "target": 20,
+      "moment": "An application has been opened for the first time today.",
+      "slots": { "app": ["Brave", "Obsidian", "Discord", "Claude Code"] },
+      "max_words": 8,
+      "allow_words": ["opening"],
+      "seeds": [
+        "{app}, first time today.",
+        "First look at {app} today.",
+        "{app}. Not been there today.",
+        "Today's first {app}.",
+        "{app}, first of the day.",
+        "Opening {app} for the first time today.",
+        "That'll be today's first {app}.",
+        "{app} makes its first appearance."
+      ]
+    },
+    {
+      "id": "app_rare",
+      "target": 20,
+      "moment": "An application that is opened perhaps twice a month has just been opened.",
+      "slots": { "app": ["Kdenlive", "GIMP", "OBS", "Audacity"] },
+      "max_words": 8,
+      "allow_words": ["something", "things"],
+      "seeds": [
+        "{app}. That's rare.",
+        "Not seen {app} in weeks.",
+        "{app}, of all things.",
+        "{app}. Been a long time.",
+        "There's {app}, finally.",
+        "Unusual — {app}.",
+        "{app}. That doesn't happen often.",
+        "Something different: {app}."
+      ]
+    },
+    {
+      "id": "app_odd_hour",
+      "target": 20,
+      "moment": "An application has been opened at an unusual hour — the small hours of the morning, well outside the normal working day.",
+      "slots": { "app": ["Brave", "the terminal", "Claude Code", "Obsidian"] },
+      "max_words": 9,
+      "allow_words": ["clock", "hour", "hours", "midnight", "night"],
+      "seeds": [
+        "{app}, at this hour.",
+        "Late for {app}.",
+        "{app}. Odd time for it.",
+        "Still going, then. {app}.",
+        "{app} at this time of night.",
+        "Not the usual hour for {app}.",
+        "{app}, late on.",
+        "Past midnight, and {app}."
+      ]
+    },
+    {
+      "id": "workspace_switched",
+      "target": 12,
+      "slot_note": "a workspace number, already spelled as a word. The line has to make sense as 'the desktop has switched to workspace three' — it is not a count of anything, not a duration, and not a time.",
+      "max_words": 4,
+      "moment": "The window manager has switched to a different workspace. The workspace is identified only by its number.",
+      "slots": { "workspace": ["three", "one", "five"] },
+      "seeds": [
+        "{workspace}.",
+        "Workspace {workspace}.",
+        "Over to {workspace}.",
+        "{workspace}, then.",
+        "On {workspace}.",
+        "Across to {workspace}.",
+        "{workspace} now.",
+        "{workspace} it is."
+      ]
+    },
+    {
+      "id": "monitor_connected",
+      "target": 12,
+      "moment": "A second display has been plugged in and is now part of the desktop.",
+      "slots": {},
+      "max_words": 7,
+      "allow_words": ["screen", "display", "monitor"],
+      "seeds": [
+        "Second display on.",
+        "Another screen.",
+        "Display's up.",
+        "Second screen, then.",
+        "There's the other display.",
+        "Extra display on.",
+        "Second monitor's live.",
+        "That's two screens."
+      ]
+    },
+    {
+      "id": "monitor_disconnected",
+      "target": 12,
+      "moment": "A second display has been unplugged. The desktop is back to one screen.",
+      "slots": {},
+      "max_words": 7,
+      "allow_words": ["screen", "display", "monitor"],
+      "seeds": [
+        "Display's gone.",
+        "Down to one screen.",
+        "Second screen off.",
+        "Lost the other display.",
+        "One display again.",
+        "That's the second screen away.",
+        "Back to a single screen.",
+        "Other display's unplugged."
+      ]
+    },
+    {
+      "id": "command_failed",
+      "target": 24,
+      "must_include_any": ["fail", "broke", "wrong", "crash", "fell", "luck",
+        "didn", "couldn", "wont", "unhappy", "trouble", "dead", "bad", "no",
+        "not", "never"],
+      "banned_extra": ["still", "waiting", "pending", "partway", "paused",
+        "halted", "incomplete", "needs", "requires", "again"],
+      "moment": "A command that was run in the terminal has failed. The failure must be unmistakable — this is the whole point of speaking at all.",
+      "slots": { "command": ["the build", "the tests", "the install"] },
+      "max_words": 9,
+      "seeds": [
+        "{command} failed.",
+        "{command} didn't make it.",
+        "That's {command} broken.",
+        "{command}'s gone wrong.",
+        "No luck with {command}.",
+        "{command} fell over.",
+        "{command} didn't finish.",
+        "{command} came back unhappy."
+      ]
+    },
+    {
+      "id": "command_succeeded_long",
+      "target": 20,
+      "must_include_any": ["done", "finished", "finish", "through", "good",
+        "came", "took", "complete", "completed", "passed", "fine", "made",
+        "over", "clear", "well"],
+      "banned_extra": ["failed", "fail", "timed", "error", "broken", "crashed",
+        "wrong", "problem", "issue"],
+      "moment": "A long-running command has finished successfully. It ran long enough that attention had probably wandered.",
+      "slots": {
+        "command": ["the build", "the tests", "the install"],
+        "duration": ["forty seconds", "two minutes"]
+      },
+      "max_words": 10,
+      "allow_words": ["took"],
+      "seeds": [
+        "{command}'s done. {duration}.",
+        "{command} finished after {duration}.",
+        "All good with {command}. {duration}.",
+        "That's {command} through. {duration}.",
+        "{command} came back. {duration}.",
+        "{duration}, and {command}'s done.",
+        "Finished — {command}. {duration}.",
+        "Took {duration}. {command} is fine."
+      ]
+    },
+    {
+      "id": "claude_blocked",
+      "target": 20,
+      "must_include_any": ["claude"],
+      "moment": "A Claude Code session has stopped and is waiting for an answer. Nothing moves until it gets one. This is the single most valuable thing the system ever says, so it must be instantly recognisable as a summons.",
+      "slots": {},
+      "max_words": 7,
+      "allow_words": ["something", "wait", "waiting", "you", "your"],
+      "seeds": [
+        "Claude needs you.",
+        "Claude's waiting.",
+        "Claude's stopped to ask something.",
+        "Claude wants a word.",
+        "Claude's stuck on a question.",
+        "Waiting on you — Claude.",
+        "Claude's paused for you.",
+        "Claude needs an answer."
+      ]
+    },
+    {
+      "id": "claude_blocked_project",
+      "target": 20,
+      "must_include_any": ["claude"],
+      "moment": "A Claude Code session is waiting for an answer, and there is more than one session running, so the project has to be named to say which.",
+      "slots": { "project": ["Prometheus", "ASCII Art Studio", "Research"] },
+      "max_words": 9,
+      "allow_words": ["wait", "waiting", "you", "your"],
+      "seeds": [
+        "Claude needs you — {project}.",
+        "Claude's waiting on {project}.",
+        "{project}. Claude needs an answer.",
+        "Claude's stopped in {project}.",
+        "Question from Claude, on {project}.",
+        "{project}, and Claude's waiting on you.",
+        "Claude wants a word about {project}.",
+        "Held up in {project} — Claude's asking."
+      ]
+    },
+    {
+      "id": "claude_finished",
+      "target": 16,
+      "must_include_any": ["claude"],
+      "moment": "A Claude Code session has finished its turn, and there is nothing about the result worth summarising — only the fact that it has stopped.",
+      "slots": {},
+      "max_words": 7,
+      "seeds": [
+        "Claude's done.",
+        "That's Claude finished.",
+        "Claude's stopped.",
+        "Claude's through.",
+        "Claude's wrapped up.",
+        "Claude's finished up.",
+        "That's it from Claude.",
+        "Claude's quiet now."
+      ]
+    },
+    {
+      "id": "toggled_on",
+      "target": 10,
+      "must_include_any": ["listening", "on", "awake", "up", "back", "here",
+        "ears", "with", "right"],
+      "moment": "The system has just been switched on by its keyboard shortcut. This confirms the keypress registered, and which of the two states it landed in — so it must be impossible to mistake for the off confirmation.",
+      "slots": {},
+      "max_words": 5,
+      "allow_words": ["i"],
+      "seeds": [
+        "Listening.",
+        "On.",
+        "Right, listening.",
+        "Up and listening.",
+        "Awake.",
+        "Back on.",
+        "Listening now.",
+        "Right — on."
+      ]
+    },
+    {
+      "id": "toggled_off",
+      "target": 10,
+      "must_include_any": ["quiet", "off", "silence", "silent", "shutting",
+        "hush", "done", "out", "night", "enough"],
+      "moment": "The system has just been switched off by its keyboard shortcut, and this is the last thing it says before going silent. It must be impossible to mistake for the on confirmation.",
+      "slots": {},
+      "max_words": 5,
+      "allow_words": ["i"],
+      "seeds": [
+        "Quiet.",
+        "Off.",
+        "Going quiet.",
+        "Quiet, then.",
+        "That's me off.",
+        "Silence.",
+        "Shutting up.",
+        "Quiet from here."
+      ]
+    },
+    {
+      "id": "battery_low",
+      "target": 16,
+      "allow_words": ["battery"],
+      "moment": "The battery is low enough to be worth mentioning. The percentage is the only number worth saying.",
+      "slots": { "percent": ["ten percent", "fifteen percent"] },
+      "max_words": 9,
+      "seeds": [
+        "Battery at {percent}.",
+        "{percent} of battery left.",
+        "Battery's down to {percent}.",
+        "{percent}. Worth finding a cable.",
+        "Low battery — {percent}.",
+        "Battery's at {percent} and dropping.",
+        "{percent} left on the battery.",
+        "Down to {percent}."
+      ]
+    },
+    {
+      "id": "brief_empty",
+      "target": 16,
+      "moment": "A briefing was asked for, and nothing at all has happened since the last one.",
+      "slots": { "span": ["fifteen minutes", "an hour"] },
+      "max_words": 9,
+      "allow_words": ["hour", "hours", "minute", "minutes"],
+      "seeds": [
+        "Quiet for the last {span}.",
+        "Nothing in the last {span}.",
+        "Last {span}: nothing.",
+        "{span} of nothing.",
+        "A quiet {span}.",
+        "{span}, and nothing to report.",
+        "Nothing worth reporting in {span}.",
+        "The last {span} was quiet."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+[Unit]
+Description=Prometheus boot state reader
+Documentation=file:%h/Work/prometheus/docs/07-resource-profile.md
+# The only Prometheus unit wanted by default.target. Runs once at login, reads
+# the persisted toggle state, starts the tree only if it says on, and exits.
+# This is what makes the toggle survive a reboot at zero resident cost.
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=%h/Work/prometheus/bin/prometheus-boot
+
+[Install]
+WantedBy=default.target

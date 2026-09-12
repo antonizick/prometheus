@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Records what was dictated *to* the machine into the Prometheus transcript,
+# then passes the text through untouched.
+#
+# Designed to sit in voxtype's [output.post_process] hook, which pipes every
+# transcription through a command on its way to the cursor. This is the input
+# half of "everything said to and by the system"; the daemon writes the output
+# half itself.
+#
+# Wire it up in ~/.config/voxtype/config.toml:
+#
+#   [output.post_process]
+#   command = "prometheus-capture-dictation"
+#   timeout_ms = 5000
+#
+# It preserves the existing trailing-full-stop trim, so replacing the old sed
+# with this changes nothing about what gets typed.
+#
+# Fails open: if anything here breaks, the transcription still reaches the
+# cursor. Dictation must never be blocked by logging.
+set -uo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/prometheus"
+TRANSCRIPT="$STATE_DIR/transcript.jsonl"
+
+text="$(cat)"
+
+# Same transformation the previous sed hook applied.
+cleaned="$(printf '%s' "$text" | sed -E 's/\.[[:space:]]*$//')"
+
+# Emit first: the cursor should never wait on our bookkeeping.
+printf '%s' "$cleaned"
+
+{
+  mkdir -p "$STATE_DIR" 2>/dev/null &&
+  printf '%s\n' "$cleaned" | jq -Rc \
+      --argjson t "$(date +%s.%3N)" \
+      '{t: $t, dir: "in", text: ., source: "voxtype"}' \
+      >> "$TRANSCRIPT"
+
+  # Renaming by voice, if identity.rename_by_voice is on. It only fires on
+  # "<current name>, your name is now X" — addressing it by the name it
+  # already has is what keeps ordinary dictation from triggering a rename.
+  # Runs after the text has already been emitted, so it can never delay or
+  # alter what reaches the cursor.
+  prometheus name-detect "$cleaned"
+} 2>/dev/null || true

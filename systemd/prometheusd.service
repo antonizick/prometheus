@@ -1,0 +1,23 @@
+[Unit]
+Description=Prometheus speech broker
+Documentation=file:%h/Work/prometheus/docs/01-architecture.md
+PartOf=prometheus.target
+After=voxtype.service
+
+[Service]
+# notify: `systemctl start` returns only once the socket is bound, so a
+# producer can never race against daemon startup.
+Type=notify
+NotifyAccess=main
+ExecStart=%h/Work/prometheus/bin/prometheusd
+Restart=on-failure
+RestartSec=2
+# Never let the voice layer compete with real work for CPU.
+Nice=5
+IOSchedulingClass=idle
+# The broker only ever needs its own state, config and runtime dirs.
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=prometheus.target

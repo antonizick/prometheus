@@ -1,0 +1,32 @@
+[Unit]
+Description=Prometheus local LLM runtime (Ollama, on-demand only)
+Documentation=file:%h/Work/prometheus/docs/03-model-selection.md
+PartOf=prometheus.target
+
+[Service]
+Type=simple
+Environment=OLLAMA_HOST=127.0.0.1:11434
+# The one genuine dial (docs/07): how long a model stays resident in VRAM
+# after its last use. 5m is the contract default; never -1 (models.json
+# controls the actual keep_alive sent per request, this is just the
+# server-wide fallback for calls that don't specify one).
+Environment=OLLAMA_KEEP_ALIVE=5m
+ExecStart=/usr/bin/ollama serve
+Restart=on-failure
+RestartSec=2
+Nice=5
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+
+# Deliberately NO [Install] section. This unit is never WantedBy=
+# prometheus.target — starting the target must not start Ollama (docs/07:
+# "the GPU is completely free" in the WARM state). It is started only on
+# demand, by bin/prometheus-llm's first call, via
+# `systemctl --user start prometheus-ollama.service`. PartOf=prometheus.target
+# still guarantees it is torn down whenever the toggle goes off, even if a
+# summary was mid-flight — see docs/07's COLD-state contract ("Everything is
+# stopped: ... Ollama, and the loaded model").
+#
+# The pacman-shipped ollama.service stays disabled and unused; this is a
+# separate, Prometheus-scoped unit so the two can never conflict about who
+# manages the process's lifecycle.

@@ -1,0 +1,204 @@
+{
+  // What you call it. Used wherever the system refers to itself, and injected
+  // into persona prompts and phrase-bank generation from Phase 2 onward. Any
+  // intent text containing {{name}} has it substituted by the broker, so a
+  // producer never has to read this file.
+  //
+  //   prometheus name                    what is it called now
+  //   prometheus name "Athena"           rename, then speak it back
+  //   prometheus name "Aletheia" --spoken-as "Alaythia"
+  //
+  // Naming is validated by ear, not by rule: the failure mode is Piper
+  // mispronouncing it, which no amount of checking can catch. If the name is
+  // right but sounds wrong, respell it in `spoken_as` — that changes only how
+  // it is spoken, never how it is written.
+  "identity": {
+    "name": "Prometheus",
+    "spoken_as": null,
+    "confirm_on_change": true,
+
+    // Rename by saying "<current name>, your name is now X" into dictation.
+    // Off by default: it puts a rename check on the path of everything you
+    // dictate, and needs prometheus-capture-dictation wired into voxtype's
+    // [output.post_process] hook to work at all.
+    "rename_by_voice": false
+  },
+
+  // Seeds only. Live state is ~/.local/state/prometheus/{enabled,verbosity},
+  // written by the toggle and watched by the daemon via inotify.
+  "enabled": true,
+  "verbosity": "normal",
+
+  // Overall register. Changing this one word and running `prometheus regenerate`
+  // rewrites the entire phrase bank in the new voice (~30s). The finer control
+  // is persona.md; this is the coarse dial.   [Phase 2]
+  //   terse   -> "Build failed. Two errors."
+  //   neutral -> "The build failed with two errors in the parser."
+  //   warm    -> "Build's unhappy - a couple of errors in the parser."
+  "register": "neutral",
+
+  "log_level": "info",
+
+  "voice": {
+    "binary": "/opt/piper-tts/piper",
+    "espeak_data": "/opt/piper-tts/espeak-ng-data",
+    "voices_dir": "~/.local/share/piper/voices",
+
+    "system": {
+      // LOCKED. Settled, and should not drift by accident.
+      "model": "en_GB-alan-medium",
+      "length_scale": 0.7
+    },
+
+    // Second voice, used for Claude Code output so you can tell the agent
+    // apart from the machine. Chosen by audition 2026-09-11.
+    //
+    //   "enabled": false  ->  EVERYTHING speaks as Alan, the primary voice.
+    //
+    // That is the single switch back to one voice. It hot-reloads, and the
+    // second Piper process is not spawned at all when it's off, so it costs
+    // nothing. Equivalent, without editing this file:
+    //
+    //   prometheus voice single     everything as Alan
+    //   prometheus voice dual       back to two voices
+    //   prometheus voice            show which mode you're in
+    "agent": {
+      "model": "en_GB-alba-medium",
+      "length_scale": 0.7,
+      "enabled": true
+    },
+
+    // Which voice each intent category speaks in. Any category not listed
+    // here uses the system voice; an unknown or disabled voice falls back to
+    // it too, so nothing goes silent if the agent voice is turned off.
+    "category_map": { "claude": "agent" }
+  },
+
+  "audio": {
+    // Shallow playback buffer so the shut-up key cuts speech mid-word.
+    "latency_msec": 50,
+    // Our own inter-sentence pause. Piper itself runs with --sentence_silence 0
+    // because its built-in padding is excluded from the duration it reports,
+    // which would desynchronise PCM framing.
+    "inter_sentence_ms": 200
+  },
+
+  // Phase 1: the Hyprland event listener (prometheus-hypr) and `prometheus
+  // brief`. No narration yet — this is the pull path, collecting data first.
+  "hypr": {
+    // Quiet time after a focus change before it's journaled. Alt-tabbing to
+    // find a window should produce silence, then one entry for where you
+    // landed, not one per window passed through.
+    "debounce_secs": 1.5,
+
+    "journal": { "enabled": true, "max_bytes": 4194304 },
+
+    // class -> friendly name. This IS the allowlist (docs/01: "allowlist,
+    // not denylist") — a window class with no entry here is never journaled
+    // or narrated, no matter how often it's focused. Seeded from this
+    // machine's installed .desktop files (StartupWMClass); extend it as
+    // `prometheus log -f` shows unknown classes worth naming.
+    "app_names": {
+      "brave-browser": "Brave",
+      "foot": "the terminal",
+      "org.omarchy.agent": "Claude Code",
+      "discord": "Discord",
+      "md.obsidian.Obsidian": "Obsidian",
+      "obs": "OBS",
+      "kdenlive": "Kdenlive",
+      "gimp": "GIMP",
+      "Audacity": "Audacity",
+      "keepassxc": "KeePassXC"
+    }
+  },
+
+  "mic_gate": {
+    "enabled": true,
+    // Speak only while voxtype reports one of these states. Anything else
+    // (recording, transcribing) stops speech immediately and holds the queue.
+    "speak_states": ["idle"]
+  },
+
+  "speak": {
+    "claude_blocked":    { "enabled": true,  "priority": "critical" },
+    "claude_finished":   { "enabled": true,  "priority": "normal",  "min_turn_secs": 0 },
+    "command_failed":    { "enabled": true,  "priority": "normal",  "min_duration_secs": 10 },
+    "command_succeeded": { "enabled": false, "min_duration_secs": 30 },
+    "desktop_activity":  { "enabled": true,  "priority": "ambient", "target_rate": 0.15 }
+  },
+
+  "attention": {
+    "novelty_boost": 2.0,
+    "rarity_boost": 1.5,
+    "odd_hour_boost": 1.8,
+    "recent_speech_penalty": 0.15,
+    "repetition_penalty": 0.4,
+    "rapid_switch_penalty": 0.1,
+    "quiet_period_secs": 45
+  },
+
+  "limits": {
+    "max_words_unprompted": 15,
+    "max_words_summary": 30,
+    "max_utterances_per_minute": 4,
+    "dedup_window_secs": 30,
+    // Per-category overrides for max_utterances_per_minute.
+    // "critical" is always exempt: a blocked agent must be able to speak.
+    "per_category": { "manual": 60 }
+  },
+
+  "llm": {
+    // NOT "qwen3:4b" — that tag now resolves to the thinking-only 2507
+    // release, which ignores "think": false and burns the entire
+    // num_predict budget on chain-of-thought before ever answering (found
+    // empirically in Phase 2 benchmarking; see experiments/model-bench.md).
+    // "-instruct" is the non-thinking sibling, confirmed clean over 20 real
+    // samples in benchmarking.
+    "runtime_model": "qwen3:4b-instruct",
+
+    // Phrase-bank authoring — a different job with different failure modes, so
+    // a different model (docs/03: "the best model that fits in VRAM, not the
+    // fastest"). qwen3:8b was the plan; head-to-head on the real authoring
+    // prompt it wrote poetic nonsense and invented detail it could not know
+    // ("Brave's tabs still wait"), while gemma2:9b wrote plain English that
+    // sounds like speech. Yield through the validator, measured: 43% against
+    // qwen3:8b's 18%. See notes/2026-09-11-phase-2b.md.
+    "authoring_model": "gemma2:9b",
+    // Used only if the authoring model is missing from `ollama list`.
+    "authoring_fallback_model": "qwen3:8b",
+    // Authoring is not latency-bound — nobody is waiting on it — so it gets a
+    // budget the 4s runtime path could never have.
+    "authoring_timeout_secs": 180,
+    // Higher than the runtime temperature: variety is the entire product here,
+    // and accuracy is protected by the validator rather than by the sampler.
+    "authoring_temperature": 0.95,
+
+    "keep_alive": "5m",
+    "timeout_secs": 4,
+    "temperature": 0.7,
+    "num_predict": 60,
+    "host": "127.0.0.1:11434",
+    "server_start_wait_secs": 2.0
+  },
+
+  // The offline phrase bank (ADR-0004). `prometheus regenerate` writes
+  // ~/.local/state/prometheus/phrasebank.json from persona.md, about-me.md and
+  // phrasebank-spec.json; `prometheus phrase <event>` is the runtime lookup.
+  // Nothing at event time ever loads a model.
+  "phrasebank": {
+    "variants_per_event": 40,
+    // Never repeat a phrasing within this many uses of the same event.
+    "avoid_last_n": 15,
+    "regenerate_days": 7,
+    // Rounds of generation per event before banking what we have. Each round
+    // is one model call asking for batch_size lines; roughly half are rejected.
+    "max_rounds": 14,
+    "batch_size": 5,
+    // Regenerate on its own when persona.md, about-me.md, the spec or the
+    // register changes (ADR-0004). Detached and rate-limited: the runtime
+    // lookup notices the bank is stale, kicks off a background regeneration,
+    // and answers from the old bank immediately rather than waiting.
+    "auto_regenerate": true,
+    "auto_regenerate_cooldown_secs": 900
+  }
+}

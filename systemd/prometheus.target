@@ -1,0 +1,6 @@
+[Unit]
+Description=Prometheus conversational voice layer
+Documentation=file:%h/Work/prometheus/docs/01-architecture.md
+# Deliberately NOT WantedBy=default.target. Booting with Prometheus off must
+# start nothing at all (docs/07-resource-profile.md, rule 4) — prometheus-boot
+# starts this target only if the persisted state says on.

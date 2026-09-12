@@ -1,0 +1,1471 @@
+#!/usr/bin/env python3
+"""prometheus — control and test harness for the Prometheus speech broker.
+
+  prometheus say TEXT [-p PRIORITY] [-c CATEGORY] [--dedup-key K] [--ttl MS]
+                      [--preempt] [--wait]
+  prometheus stop                  # shut up: flush queue, cut current utterance
+  prometheus on | off | toggle     # the power switch (starts/stops units)
+  prometheus verbosity [quiet|normal|chatty|cycle]
+  prometheus status
+  prometheus reload
+  prometheus audition [--list]     # audition candidate second voices (task 0.10)
+  prometheus journal [-f]          # the filtered Hyprland event history (Phase 1)
+  prometheus brief [--print]       # summarize the journal since the last brief
+  prometheus feedback "too chatty" # note a verdict, with the evidence attached
+  prometheus regenerate            # rewrite the phrase bank (offline, minutes)
+  prometheus phrase EVENT          # one phrasing from the bank (instant)
+
+Writing to a dead socket fails silently: a producer must never be blocked or
+broken by the daemon being down.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+CONFIG_DIR = os.environ.get("PROMETHEUS_CONFIG_DIR") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or f"{HOME}/.config", "prometheus")
+STATE_DIR = os.environ.get("PROMETHEUS_STATE_DIR") or os.path.join(
+    os.environ.get("XDG_STATE_HOME") or f"{HOME}/.local/state", "prometheus")
+SOCK_PATH = os.path.join(RUNTIME_DIR, "prometheus", "sock")
+ENABLED_FILE = os.path.join(STATE_DIR, "enabled")
+VERBOSITY_FILE = os.path.join(STATE_DIR, "verbosity")
+JOURNAL_PATH = os.path.join(STATE_DIR, "journal")
+LAST_BRIEF_FILE = os.path.join(STATE_DIR, "last_brief")
+VERBOSITIES = ("quiet", "normal", "chatty")
+TARGET = "prometheus.target"
+
+
+def warn(msg: str) -> None:
+    """Only complain when a human is watching — hooks must stay quiet."""
+    if sys.stderr.isatty():
+        print(f"prometheus: {msg}", file=sys.stderr)
+
+
+def send(obj: dict, wait: bool = False, timeout: float = 10.0) -> dict | None:
+    """Fire-and-forget by default; opt into a reply with wait=True."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(SOCK_PATH)
+    except OSError as e:
+        warn(f"not speaking — daemon unreachable ({e.strerror or e})")
+        return None
+    try:
+        if wait:
+            obj = dict(obj, ack=True)
+        s.sendall(json.dumps(obj).encode() + b"\n")
+        if not wait:
+            return None
+        s.settimeout(timeout)
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                return None
+            buf += chunk
+        return json.loads(buf.split(b"\n", 1)[0])
+    except (OSError, ValueError) as e:
+        warn(f"socket error: {e}")
+        return None
+    finally:
+        s.close()
+
+
+def write_state(path: str, value: str) -> None:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        f.write(value + "\n")
+    os.replace(tmp, path)
+
+
+def read_state(path: str, default: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip() or default
+    except OSError:
+        return default
+
+
+def systemctl(*args: str, check: bool = False) -> int:
+    return subprocess.run(["systemctl", "--user", *args],
+                          stdout=subprocess.DEVNULL if not check else None).returncode
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def cmd_say(a) -> int:
+    text = " ".join(a.text).strip()
+    if not text:
+        return 0
+    intent = {"text": text, "priority": a.priority, "category": a.category}
+    if a.dedup_key:
+        intent["dedup_key"] = a.dedup_key
+    if a.ttl:
+        intent["ttl_ms"] = a.ttl
+    if a.preempt:
+        intent["preempt"] = True
+    reply = send(intent, wait=a.wait)
+    if a.wait and reply:
+        print(f"{reply.get('status')}: {reply.get('detail', '')}".rstrip(": "))
+    return 0
+
+
+def cmd_stop(_a) -> int:
+    send({"control": "stop"})
+    return 0
+
+
+def cmd_reload(_a) -> int:
+    send({"control": "reload"})
+    return 0
+
+
+def ollama_release() -> None:
+    """Hand the GPU back immediately rather than waiting for keep-alive."""
+    if not shutil.which("ollama"):
+        return
+    try:
+        out = subprocess.run(["ollama", "ps"], capture_output=True, text=True,
+                             timeout=5).stdout.splitlines()[1:]
+    except Exception:
+        return
+    for line in out:
+        name = line.split()[0] if line.split() else ""
+        if name:
+            subprocess.run(["ollama", "stop", name], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10)
+    subprocess.run(["systemctl", "--user", "stop", "ollama.service"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def power_on() -> int:
+    write_state(ENABLED_FILE, "1")
+    # Type=notify: this returns only once the socket is bound and accepting.
+    systemctl("start", TARGET)
+    send({"text": "Listening.", "priority": "critical", "category": "manual"})
+    return 0
+
+
+def power_off() -> int:
+    write_state(ENABLED_FILE, "0")
+    # Speak the confirmation and wait for it before pulling the power, so the
+    # feedback about which state you just entered actually gets heard.
+    send({"text": "Quiet.", "priority": "critical", "category": "manual",
+          "preempt": True}, wait=True, timeout=5.0)
+    systemctl("stop", TARGET)
+    ollama_release()
+    return 0
+
+
+def cmd_on(_a) -> int:
+    return power_on()
+
+
+def cmd_off(_a) -> int:
+    return power_off()
+
+
+def cmd_toggle(_a) -> int:
+    return power_off() if read_state(ENABLED_FILE, "0") == "1" else power_on()
+
+
+def cmd_verbosity(a) -> int:
+    current = read_state(VERBOSITY_FILE, "normal")
+    level = a.level
+    if level is None:
+        print(current)
+        return 0
+    if level == "cycle":
+        idx = VERBOSITIES.index(current) if current in VERBOSITIES else 1
+        level = VERBOSITIES[(idx + 1) % len(VERBOSITIES)]
+    if level not in VERBOSITIES:
+        print(f"verbosity must be one of {', '.join(VERBOSITIES)}", file=sys.stderr)
+        return 2
+    write_state(VERBOSITY_FILE, level)
+    send({"text": level.capitalize() + ".", "priority": "critical",
+          "category": "manual", "preempt": True})
+    return 0
+
+
+def cmd_status(_a) -> int:
+    enabled = read_state(ENABLED_FILE, "0")
+    target = subprocess.run(["systemctl", "--user", "is-active", TARGET],
+                            capture_output=True, text=True).stdout.strip()
+    print(f"toggle state     : {'on' if enabled == '1' else 'off'}  ({ENABLED_FILE})")
+    print(f"verbosity        : {read_state(VERBOSITY_FILE, 'normal')}")
+    print(f"{TARGET:17}: {target}")
+    print(f"socket           : {'present' if os.path.exists(SOCK_PATH) else 'absent'}"
+          f"  ({SOCK_PATH})")
+
+    rows, total = [], 0
+    for pid, rss, comm in _own_processes():
+        rows.append((pid, rss, comm))
+        total += rss
+
+    print(f"processes        : {len(rows)}")
+    for pid, rss, comm in rows:
+        print(f"  {comm:<14} pid {pid:>7}  {rss / 1024:7.1f} MB")
+    if rows:
+        print(f"  {'TOTAL':<14} {'':>11}  {total / 1024:7.1f} MB")
+
+    reply = send({"control": "ping"}, wait=True, timeout=2.0)
+    print(f"daemon           : {'responding' if reply else 'not responding'}")
+    return 0
+
+
+def cmd_log(a) -> int:
+    """Tail a daemon log. The journal is the source of truth for stderr."""
+    unit = "prometheus-hypr.service" if a.hypr else "prometheusd.service"
+    stem = "prometheus-hypr" if a.hypr else "prometheusd"
+    if a.file:
+        path = os.path.join(STATE_DIR, f"{stem}.log")
+        if not os.path.exists(path):
+            print(f"no structured log at {path}", file=sys.stderr)
+            return 1
+        argv = ["tail", "-n", str(a.lines)] + (["-f"] if a.follow else []) + [path]
+    else:
+        argv = ["journalctl", "--user", "-u", unit,
+                "-n", str(a.lines), "-o", "cat"] + (["-f"] if a.follow else [])
+    try:
+        return subprocess.run(argv).returncode
+    except KeyboardInterrupt:
+        return 0
+
+
+def cmd_transcript(a) -> int:
+    """Everything said to and by the system."""
+    path = os.path.join(STATE_DIR, "transcript.jsonl")
+    if not os.path.exists(path):
+        print(f"nothing recorded yet ({path})", file=sys.stderr)
+        return 1
+    if a.raw:
+        argv = ["tail", "-n", str(a.lines)] + (["-f"] if a.follow else []) + [path]
+        try:
+            return subprocess.run(argv).returncode
+        except KeyboardInterrupt:
+            return 0
+
+    import datetime
+
+    def render(line: str) -> None:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            return
+        if a.spoken_only and r.get("status") != "spoken":
+            return
+        ts = datetime.datetime.fromtimestamp(r.get("t", 0)).strftime("%H:%M:%S")
+        arrow = "<<" if r.get("dir") == "in" else ">>"
+        status = r.get("status", "")
+        tag = f"[{r.get('reason') or status}]" if status != "spoken" else ""
+        meta = f"{r.get('category', '')}/{r.get('priority', '')}".strip("/")
+        print(f"{ts} {arrow} {r.get('text', '')}"
+              + (f"   {tag}" if tag else "")
+              + (f"   ({meta})" if meta and a.verbose else ""))
+
+    if a.follow:
+        proc = subprocess.Popen(["tail", "-n", str(a.lines), "-f", path],
+                                stdout=subprocess.PIPE, text=True)
+        try:
+            for line in proc.stdout:
+                render(line)
+        except KeyboardInterrupt:
+            proc.terminate()
+        return 0
+    with open(path) as f:
+        for line in f.readlines()[-a.lines:]:
+            render(line)
+    return 0
+
+
+def cmd_journal(a) -> int:
+    """The filtered Hyprland event history prometheus-hypr writes (Phase 1)."""
+    path = JOURNAL_PATH
+    if not os.path.exists(path):
+        print(f"nothing recorded yet ({path})", file=sys.stderr)
+        return 1
+    if a.raw:
+        argv = ["tail", "-n", str(a.lines)] + (["-f"] if a.follow else []) + [path]
+        try:
+            return subprocess.run(argv).returncode
+        except KeyboardInterrupt:
+            return 0
+
+    import datetime
+
+    def render(line: str) -> None:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            return
+        ts = datetime.datetime.fromtimestamp(r.get("t", 0)).strftime("%H:%M:%S")
+        kind = r.get("kind", "")
+        label = r.get("name") or r.get("cls") or r.get("workspace") or r.get("monitor") or r.get("state") or ""
+        extra = f"  (x{r['coalesced']})" if r.get("coalesced") else ""
+        print(f"{ts}  {kind:<10} {label}{extra}")
+
+    if a.follow:
+        proc = subprocess.Popen(["tail", "-n", str(a.lines), "-f", path],
+                                stdout=subprocess.PIPE, text=True)
+        try:
+            for line in proc.stdout:
+                render(line)
+        except KeyboardInterrupt:
+            proc.terminate()
+        return 0
+    with open(path) as f:
+        for line in f.readlines()[-a.lines:]:
+            render(line)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# brief (Phase 1 task 1.5; Phase 2 task 2.7) — the pull path
+# --------------------------------------------------------------------------
+#
+# Two layers, and the order matters. The journal is read and turned into a
+# DIGEST of plain facts — that part is deterministic and is the only thing that
+# ever touches the event data. The digest is then handed to the local model to
+# be said like a person would say it (task 2.7).
+#
+# The model is never the source of a fact, only of the wording. If it is
+# unreachable, slow, or returns nothing, the digest's own template sentence is
+# spoken instead: a briefing was ASKED for, so answering nothing to a keypress
+# is the one outcome that isn't allowed.
+#
+# What's interesting is still a separate question, handled offline by
+# experiments/replay-scoring.py — that decides what would be worth *pushing*
+# unprompted. brief reports everything, because it was pulled.
+
+BRIEF_DEFAULT_LOOKBACK_SECS = 15 * 60
+BRIEF_MAX_LOOKBACK_SECS = 3600  # never claim to cover more than an hour
+BRIEF_MIN_DWELL_SECS = 25       # below this, a window was passed through
+
+
+def _read_journal_since(ts: float) -> list[dict]:
+    events = []
+    try:
+        with open(JOURNAL_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("t", 0) > ts:
+                    events.append(rec)
+    except OSError:
+        pass
+    return events
+
+
+# The digest is fed to a model and then spoken, so it is written the way it
+# should be said. A digest full of "9" and "81" comes back as "9min" and "81s",
+# which are things you read, not things you hear (docs/06, principle 3).
+_ONES = ("zero one two three four five six seven eight nine ten eleven twelve "
+         "thirteen fourteen fifteen sixteen seventeen eighteen nineteen").split()
+_TENS = {20: "twenty", 30: "thirty", 40: "forty", 50: "fifty", 60: "sixty",
+         70: "seventy", 80: "eighty", 90: "ninety"}
+
+
+def _spoken_number(n: int) -> str:
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        tens = _TENS[n // 10 * 10]
+        return tens if n % 10 == 0 else f"{tens}-{_ONES[n % 10]}"
+    return str(n)       # past a hundred, say the digits and let Piper cope
+
+
+def _format_span(secs: float) -> str:
+    secs = max(0, int(secs))
+    if secs < 90:
+        return f"{_spoken_number(secs)} seconds"
+    mins = round(secs / 60)
+    return f"{_spoken_number(mins)} minute" + ("s" if mins != 1 else "")
+
+
+def _speak_list(items: list[str]) -> str:
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def _uniq_ordered(items: list[str]) -> list[str]:
+    seen, out = set(), []
+    for i in items:
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
+def _dwell_by_app(events: list[dict], now: float) -> list[tuple[str, float]]:
+    """Seconds spent focused in each app, longest first.
+
+    A focus entry owns the time until the next journalled event of any kind,
+    which is the best this data supports — the journal records arrivals, not
+    departures. Short stretches are dropped by the caller: they are windows
+    passed through, not time spent.
+    """
+    spans: dict[str, float] = {}
+    for i, e in enumerate(events):
+        if e.get("kind") != "focus" or not e.get("name"):
+            continue
+        end = events[i + 1]["t"] if i + 1 < len(events) else now
+        spans[e["name"]] = spans.get(e["name"], 0.0) + max(0.0, end - e.get("t", end))
+    return sorted(spans.items(), key=lambda kv: -kv[1])
+
+
+def _phrase(event: str, slots: dict) -> str | None:
+    """One phrasing from the bank (Phase 2, task 2.9), or None.
+
+    Shelled out rather than imported: `brief` is a keypress, not an event-time
+    path, so a process start is free here. An ambient narrator holds a Bank
+    object in-process instead.
+    """
+    tool = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                        "prometheus-phrasebank")
+    if not os.path.exists(tool):
+        return None
+    args = [tool, "pick", event]
+    for k, v in slots.items():
+        args += ["--slot", f"{k}={v}"]
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    line = out.stdout.strip()
+    return line or None
+
+
+def _brief_digest(events: list[dict], span: str, now: float) -> tuple[str, str]:
+    """Return (digest for the model, deterministic sentence to fall back on)."""
+    opened, focused, closed, workspace_switches = [], [], [], 0
+    for e in events:
+        kind, name = e.get("kind"), e.get("name")
+        if kind == "open" and name:
+            opened.append(name)
+        elif kind == "focus" and name:
+            focused.append(name)
+        elif kind == "close" and name:
+            closed.append(name)
+        elif kind == "workspace":
+            workspace_switches += 1
+
+    opened_u, landed_u = _uniq_ordered(opened), _uniq_ordered(focused)
+    closed_u = _uniq_ordered([c for c in closed if c not in opened_u])
+
+    parts = []
+    if opened_u:
+        parts.append("opened " + _speak_list(opened_u))
+    if landed_u:
+        parts.append("spent time in " + _speak_list(landed_u))
+    if workspace_switches:
+        parts.append(f"switched workspace {_spoken_number(workspace_switches)} "
+                     f"time{'s' if workspace_switches != 1 else ''}")
+    if closed_u:
+        parts.append("closed " + _speak_list(closed_u))
+    template = "" if not parts else f"In the last {span}: " + "; ".join(parts) + "."
+
+    lines = [f"Time covered: the last {span}."]
+    if opened_u:
+        lines.append("Applications opened: " + ", ".join(opened_u) + ".")
+    dwell = [(n, s) for n, s in _dwell_by_app(events, now) if s >= BRIEF_MIN_DWELL_SECS]
+    if dwell:
+        lines.append("Time spent, longest first: "
+                     + ", ".join(f"{n} for {_format_span(s)}" for n, s in dwell) + ".")
+    if workspace_switches:
+        lines.append(f"Workspace switches: {_spoken_number(workspace_switches)}.")
+    if closed_u:
+        lines.append("Applications closed: " + ", ".join(closed_u) + ".")
+    if len(lines) == 1:
+        lines.append("Nothing else happened.")
+    return "\n".join(lines), template
+
+
+def cmd_brief(a) -> int:
+    now = time.time()
+    raw = read_state(LAST_BRIEF_FILE, "")
+    try:
+        since_ts = float(raw) if raw else now - BRIEF_DEFAULT_LOOKBACK_SECS
+    except ValueError:
+        since_ts = now - BRIEF_DEFAULT_LOOKBACK_SECS
+    since_ts = max(since_ts, now - BRIEF_MAX_LOOKBACK_SECS)
+
+    events = _read_journal_since(since_ts)
+    span = _format_span(now - since_ts)
+    digest, template = _brief_digest(events, span, now)
+
+    if a.digest:
+        # Pure inspection — unlike --print, this must not move the watermark,
+        # or looking at the facts costs you the next real briefing.
+        print(digest)
+        return 0
+
+    if not template:
+        # Nothing happened. The phrase bank has variants for saying so; the
+        # hard-coded sentence is the floor if no bank has been authored yet.
+        text = _phrase("brief_empty", {"span": span}) or f"Quiet for the last {span}."
+        source = "bank" if text != f"Quiet for the last {span}." else "template"
+    else:
+        text, source = template, "template"
+        if not a.no_llm:
+            spoken = _llm_brief(digest)
+            if spoken:
+                text, source = spoken, "llm"
+
+    # Advance the watermark regardless of whether anything was said, so a
+    # `--print` peek doesn't cause the next real brief to re-cover ground.
+    write_state(LAST_BRIEF_FILE, str(now))
+
+    if a.print_only:
+        if sys.stderr.isatty():
+            print(f"[{source}]", file=sys.stderr)
+        print(text)
+    else:
+        send({"text": text, "priority": "normal", "category": "brief"})
+    return 0
+
+
+def _llm_brief(digest: str) -> str | None:
+    tool = os.path.join(os.path.dirname(os.path.realpath(__file__)), "prometheus-llm")
+    if not os.path.exists(tool):
+        return None
+    try:
+        out = subprocess.run([tool, "brief"], input=digest, capture_output=True,
+                             text=True, timeout=25)
+    except (OSError, subprocess.TimeoutExpired):
+        warn("briefing model timed out — speaking the plain version")
+        return None
+    line = out.stdout.strip()
+    return line or None
+
+
+# --------------------------------------------------------------------------
+# voice switching (task 0.10)
+# --------------------------------------------------------------------------
+#
+# config.json is JSONC — it carries the comments that explain it, so these
+# edits are surgical text substitutions inside the "agent" block rather than a
+# parse-and-rewrite, which would strip every comment in the file.
+
+def _block_span(text: str, key: str):
+    """Span of the brace-delimited object at "key": { ... }."""
+    m = re.search(r'"%s"\s*:\s*\{' % re.escape(key), text)
+    if not m:
+        return None
+    start = m.end() - 1
+    depth, in_str, esc = 0, False, False
+    for j in range(start, len(text)):
+        c = text[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return start, j + 1
+    return None
+
+
+def _set_in_block(text: str, span, key: str, value: str) -> str:
+    a, b = span
+    block = text[a:b]
+    pat = re.compile(r'("%s"\s*:\s*)([^,\n}]+)' % re.escape(key))
+    if pat.search(block):
+        block = pat.sub(lambda m: m.group(1) + value, block, count=1)
+    else:
+        head = block[:-1].rstrip().rstrip(",")
+        block = head + ',\n      "%s": %s\n    }' % (key, value)
+    return text[:a] + block + text[b:]
+
+
+def _read_config_raw() -> str:
+    with open(os.path.join(CONFIG_DIR, "config.json")) as f:
+        return f.read()
+
+
+def _write_config_raw(text: str) -> None:
+    path = os.path.join(CONFIG_DIR, "config.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def _agent_state(text: str):
+    span = _block_span(text, "agent")
+    if not span:
+        return None, None
+    block = text[span[0]:span[1]]
+    enabled = re.search(r'"enabled"\s*:\s*(true|false)', block)
+    model = re.search(r'"model"\s*:\s*(null|"([^"]*)")', block)
+    return (enabled.group(1) == "true" if enabled else False,
+            (model.group(2) if model and model.group(2) else None))
+
+
+def cmd_voice(a) -> int:
+    """Switch between one voice and two without hand-editing JSON."""
+    text = _read_config_raw()
+    span = _block_span(text, "agent")
+    if not span:
+        print("no voice.agent block in config.json", file=sys.stderr)
+        return 1
+
+    if a.action is None:
+        enabled, model = _agent_state(text)
+        print(f"system voice : en_GB-alan-medium  (locked)")
+        print(f"agent voice  : {model or '(unset)'}")
+        print(f"mode         : {'two voices' if enabled else 'single voice — everything speaks as Alan'}")
+        return 0
+
+    if a.action == "single":
+        text = _set_in_block(text, span, "enabled", "false")
+        msg = "Single voice. Everything speaks as Alan."
+    elif a.action == "dual":
+        _, model = _agent_state(text)
+        if not model:
+            print("no agent voice set yet — run: prometheus voice set <model>",
+                  file=sys.stderr)
+            return 1
+        text = _set_in_block(text, span, "enabled", "true")
+        msg = "Two voices."
+    else:                                    # set <model>
+        if not a.model:
+            print("usage: prometheus voice set <model>", file=sys.stderr)
+            return 2
+        text = _set_in_block(text, span, "model", '"%s"' % a.model)
+        span = _block_span(text, "agent")
+        text = _set_in_block(text, span, "enabled", "true")
+        msg = "Two voices."
+
+    _write_config_raw(text)
+    # inotify picks this up; no restart, no explicit reload needed.
+    enabled, model = _agent_state(text)
+    print(f"agent voice  : {model or '(unset)'}")
+    print(f"mode         : {'two voices' if enabled else 'single voice — everything speaks as Alan'}")
+    time.sleep(0.8)
+    send({"text": msg, "priority": "critical", "category": "claude", "preempt": True})
+    return 0
+
+
+# --------------------------------------------------------------------------
+# naming
+# --------------------------------------------------------------------------
+
+NAME_MAX = 40
+# Renaming by voice requires addressing it by its *current* name first, which
+# makes an accidental trigger during ordinary dictation very unlikely.
+RENAME_PATTERNS = [
+    r"your name is now", r"your new name is",
+    r"you are now called", r"you're now called",
+    r"i'm going to call you", r"i am going to call you",
+]
+
+
+def _ensure_identity_block(text: str) -> str:
+    if _block_span(text, "identity"):
+        return text
+    i = text.index("{")
+    block = ('\n  "identity": {\n'
+             '    "name": "Prometheus",\n'
+             '    "spoken_as": null,\n'
+             '    "confirm_on_change": true,\n'
+             '    "rename_by_voice": false\n'
+             '  },\n')
+    return text[:i + 1] + block + text[i + 1:]
+
+
+def _identity(text: str):
+    span = _block_span(text, "identity")
+    if not span:
+        return {"name": "Prometheus", "spoken_as": None, "rename_by_voice": False}
+    b = text[span[0]:span[1]]
+
+    def grab(key):
+        m = re.search(r'"%s"\s*:\s*(null|true|false|"([^"]*)")' % key, b)
+        if not m:
+            return None
+        if m.group(1) in ("null",):
+            return None
+        if m.group(1) in ("true", "false"):
+            return m.group(1) == "true"
+        return m.group(2)
+
+    return {"name": grab("name") or "Prometheus",
+            "spoken_as": grab("spoken_as"),
+            "rename_by_voice": grab("rename_by_voice") is True}
+
+
+def validate_name(name: str):
+    """Returns (ok, note). The real validation is hearing it — this only
+    catches things that cannot work at all, plus things Piper reads oddly."""
+    name = name.strip()
+    if not name:
+        return False, "empty"
+    if len(name) > NAME_MAX:
+        return False, f"longer than {NAME_MAX} characters"
+    if any(c in name for c in '"\\{}[]<>|'):
+        return False, "contains characters that would break the config file"
+    notes = []
+    if any(c.isdigit() for c in name):
+        notes.append("digits are read as numbers")
+    if re.search(r"[^A-Za-z0-9 '\-]", name):
+        notes.append("punctuation is often read aloud or skipped")
+    if len(name) <= 2:
+        notes.append("very short names are easy to mishear mid-sentence")
+    return True, "; ".join(notes)
+
+
+PENDING_FILE_NAME = "pending-rename"
+PENDING_TTL_SECS = 90
+CONFIRM_PATTERNS = [r"yes,? rename", r"confirm rename", r"yes,? do it",
+                    r"confirm,? rename"]
+
+
+def cmd_name_detect(a) -> int:
+    """Rename from a dictated line. Called by prometheus-capture-dictation.
+
+    Two steps, because there is no terminal to confirm in: the first line
+    proposes the name and it reads the name back, the second confirms. A name
+    is never committed off a single utterance — dictation mishears, and the
+    read-back is the only way to catch it before it sticks.
+
+    Always exits 0. Dictation must never fail because of this.
+    """
+    text = _read_config_raw()
+    ident = _identity(text)
+    if not ident["rename_by_voice"]:
+        return 0
+    said = " ".join(a.text).strip()
+    pending_path = os.path.join(STATE_DIR, PENDING_FILE_NAME)
+
+    pending = None
+    try:
+        with open(pending_path) as f:
+            pending = json.load(f)
+        if time.time() - pending.get("t", 0) > PENDING_TTL_SECS:
+            pending = None
+            os.unlink(pending_path)
+    except (OSError, ValueError):
+        pending = None
+
+    # Step two: confirming a name proposed a moment ago.
+    if pending:
+        if any(re.search(pat, said, re.IGNORECASE) for pat in CONFIRM_PATTERNS):
+            new = pending["name"]
+            text = _ensure_identity_block(text)
+            span = _block_span(text, "identity")
+            text = _set_in_block(text, span, "name", '"%s"' % new)
+            span = _block_span(text, "identity")
+            # A dictated rename can't know the right respelling.
+            text = _set_in_block(text, span, "spoken_as", "null")
+            _write_config_raw(text)
+            try:
+                os.unlink(pending_path)
+            except OSError:
+                pass
+            time.sleep(0.5)
+            send({"text": "Done. I'm {{name}}.", "priority": "critical",
+                  "category": "manual", "preempt": True})
+            return 0
+        # Anything else cancels, so a forgotten proposal can't fire later.
+        try:
+            os.unlink(pending_path)
+        except OSError:
+            pass
+
+    # Step one: propose, and read it back.
+    pattern = (r"^\s*%s\s*[,.]?\s+(?:%s)\s+([A-Za-z][A-Za-z '\-]{0,%d})\s*[.!]?\s*$"
+               % (re.escape(ident["name"]), "|".join(RENAME_PATTERNS), NAME_MAX - 1))
+    m = re.match(pattern, said, re.IGNORECASE)
+    if not m:
+        return 0
+    new = m.group(1).strip()
+    ok, _ = validate_name(new)
+    if not ok:
+        return 0
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(pending_path, "w") as f:
+            json.dump({"name": new, "t": time.time()}, f)
+    except OSError:
+        return 0
+    time.sleep(0.5)
+    send({"text": f"{new}. Say yes rename to confirm.", "priority": "critical",
+          "category": "manual", "preempt": True})
+    return 0
+
+
+def _installed_voices():
+    d = voices_dir()
+    if not os.path.isdir(d):
+        return []
+    return sorted(f[:-5] for f in os.listdir(d) if f.endswith(".onnx"))
+
+
+def _preview(name: str, voice: str | None, line: str) -> None:
+    """Say a candidate name before anything is committed.
+
+    Uses the broker when it's the current voice, so the one-owner rule holds;
+    falls back to the audition path only to preview a voice that isn't loaded.
+    """
+    text = line.replace("{{name}}", name)
+    if voice is None:
+        r = send({"text": text, "priority": "critical", "category": "manual",
+                  "preempt": True}, wait=True, timeout=15)
+        if r:
+            return
+    speak_direct(voice or "en_GB-alan-medium", text)
+
+
+def _apply_voice(text: str, model: str, system: bool) -> str:
+    key = "system" if system else "agent"
+    span = _block_span(text, key)
+    if not span:
+        return text
+    text = _set_in_block(text, span, "model", '"%s"' % model)
+    if not system:
+        span = _block_span(text, "agent")
+        text = _set_in_block(text, span, "enabled", "true")
+    return text
+
+
+def cmd_name(a) -> int:
+    text = _read_config_raw()
+    ident = _identity(text)
+
+    if not a.name:
+        print(f"name       : {ident['name']}")
+        print(f"spoken as  : {ident['spoken_as'] or '(as written)'}")
+        print(f"rename by voice : {'on' if ident['rename_by_voice'] else 'off'}")
+        if not a.quiet:
+            send({"text": "I am {{name}}.", "priority": "critical",
+                  "category": "manual", "preempt": True})
+        return 0
+
+    new = " ".join(a.name).strip().strip('."')
+    ok, note = validate_name(new)
+    if not ok:
+        print(f"can't use that name: {note}", file=sys.stderr)
+        return 2
+
+    spoken_as = a.spoken_as
+    voice = a.voice
+    system_voice = a.system_voice
+    if note:
+        print(f"note: {note}")
+
+    interactive = sys.stdin.isatty() and not a.yes and not a.quiet
+
+    # Nothing is written until it has been heard and confirmed. The whole point
+    # of naming by ear is that a name can be spelled perfectly and still come
+    # out wrong.
+    while True:
+        if not a.quiet:
+            _preview(spoken_as or new, system_voice or voice, "My name is {{name}}.")
+        if not interactive:
+            break
+        print(f"\n  name      : {new}"
+              + (f"   (spoken as \"{spoken_as}\")" if spoken_as else ""))
+        if voice or system_voice:
+            print(f"  voice     : {system_voice or voice}"
+                  f"{'   [PRIMARY — was locked]' if system_voice else '   (agent voice)'}")
+        try:
+            ans = input("\n  [y] keep it   [r] respell for speech   "
+                        "[v] change voice   [a] again   [n] cancel : ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\ncancelled — nothing changed")
+            return 1
+
+        if ans in ("y", "yes", ""):
+            break
+        if ans in ("n", "no", "q"):
+            print("cancelled — nothing changed")
+            return 1
+        if ans in ("a", "again"):
+            continue
+        if ans in ("r", "respell"):
+            try:
+                spoken_as = input("  spell it how it should sound: ").strip() or None
+            except (EOFError, KeyboardInterrupt):
+                return 1
+            continue
+        if ans in ("v", "voice"):
+            installed = _installed_voices()
+            print()
+            for i, v in enumerate(installed, 1):
+                tag = "  <- primary, locked" if v == "en_GB-alan-medium" else ""
+                print(f"    {i:>2}. {v}{tag}")
+            try:
+                pick = input("\n  number (or blank to keep current): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return 1
+            if not pick:
+                continue
+            if not pick.isdigit() or not (1 <= int(pick) <= len(installed)):
+                print("  not a listed number")
+                continue
+            chosen = installed[int(pick) - 1]
+            if chosen == "en_GB-alan-medium":
+                print("  That's the primary voice, marked locked in config.json.")
+                try:
+                    sure = input("  Change the PRIMARY voice anyway? [y/N]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    return 1
+                if sure not in ("y", "yes"):
+                    continue
+                system_voice, voice = chosen, None
+            else:
+                voice, system_voice = chosen, None
+            continue
+        print("  didn't catch that")
+
+    text = _ensure_identity_block(text)
+    span = _block_span(text, "identity")
+    text = _set_in_block(text, span, "name", '"%s"' % new)
+    span = _block_span(text, "identity")
+    text = _set_in_block(text, span, "spoken_as",
+                         '"%s"' % spoken_as if spoken_as else "null")
+    if voice:
+        text = _apply_voice(text, voice, system=False)
+    if system_voice:
+        text = _apply_voice(text, system_voice, system=True)
+    _write_config_raw(text)
+
+    print(f"\nname      : {new}"
+          + (f"   (spoken as \"{spoken_as}\")" if spoken_as else ""))
+    if voice:
+        print(f"agent voice : {voice}")
+    if system_voice:
+        print(f"PRIMARY voice : {system_voice}   (was locked — changed deliberately)")
+    return 0
+
+
+DAEMON_NAMES = ("prometheusd", "prometheus-hypr")
+
+
+# --------------------------------------------------------------------------
+# feedback — capture a verdict at the moment you have it
+# --------------------------------------------------------------------------
+#
+# The whole tuning story depends on remembering what actually annoyed you, and
+# nobody remembers a week later. So this takes a note NOW and staples the
+# evidence to it: what was said in the last few minutes, which phrasings those
+# were, and what the dials were set to at the time.
+#
+# Bound to a key, it costs two seconds and no attention:
+#   prometheus feedback "that one was too much"
+#   prometheus feedback               (records the moment with no note at all)
+
+FEEDBACK_FILE = os.path.join(STATE_DIR, "feedback.jsonl")
+FEEDBACK_CONTEXT_SECS = 300
+FEEDBACK_CONTEXT_MAX = 8
+
+
+def _recent_speech(within_secs: float, limit: int) -> list[dict]:
+    path = os.path.join(STATE_DIR, "transcript.jsonl")
+    cutoff, out = time.time() - within_secs, []
+    try:
+        with open(path) as f:
+            lines = f.readlines()[-400:]
+    except OSError:
+        return out
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("dir") != "out" or r.get("t", 0) < cutoff:
+            continue
+        out.append({"t": round(r["t"], 3), "text": r.get("text", ""),
+                    "status": r.get("status"), "reason": r.get("reason"),
+                    "category": r.get("category"), "priority": r.get("priority")})
+    return out[-limit:]
+
+
+def _config_snapshot() -> dict:
+    try:
+        with open(os.path.join(CONFIG_DIR, "config.json")) as f:
+            raw = f.read()
+    except OSError:
+        return {}
+    def grab(pattern, default=None):
+        m = re.search(pattern, raw)
+        return m.group(1) if m else default
+    return {
+        "register": grab(r'"register"\s*:\s*"([^"]+)"'),
+        "verbosity": read_state(VERBOSITY_FILE, "normal"),
+        "target_rate": grab(r'"desktop_activity"[^}]*"target_rate"\s*:\s*([0-9.]+)'),
+        "quiet_period_secs": grab(r'"quiet_period_secs"\s*:\s*(\d+)'),
+    }
+
+
+def cmd_feedback(a) -> int:
+    if a.list:
+        try:
+            with open(FEEDBACK_FILE) as f:
+                entries = [json.loads(l) for l in f if l.strip()]
+        except OSError:
+            print(f"nothing recorded yet ({FEEDBACK_FILE})", file=sys.stderr)
+            return 1
+        for e in entries[-a.lines:]:
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(e.get("t", 0)))
+            cfg = e.get("config", {})
+            print(f"\n{ts}  [{cfg.get('register', '?')}/{cfg.get('verbosity', '?')}"
+                  f" rate {cfg.get('target_rate', '?')}]")
+            print(f"  {e.get('note') or '(no note — just a marker)'}")
+            for r in e.get("recent", [])[-4:]:
+                mark = "spoke" if r.get("status") == "spoken" else (r.get("reason") or "dropped")
+                print(f"    {time.strftime('%H:%M:%S', time.localtime(r['t']))} "
+                      f"{mark:>8}  {r.get('text', '')[:70]}")
+        print()
+        return 0
+
+    note = " ".join(a.note).strip()
+    entry = {
+        "t": round(time.time(), 3),
+        "note": note or None,
+        "config": _config_snapshot(),
+        "recent": _recent_speech(FEEDBACK_CONTEXT_SECS, FEEDBACK_CONTEXT_MAX),
+    }
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(FEEDBACK_FILE, "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    n = len(entry["recent"])
+    print(f"noted{' — ' + note if note else ''}")
+    print(f"  with the last {n} utterance{'s' if n != 1 else ''} for context"
+          if n else "  (nothing was spoken in the last five minutes to attach)")
+    print(f"  {FEEDBACK_FILE}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# phrase bank (Phase 2, tasks 2.8-2.9)
+# --------------------------------------------------------------------------
+#
+# Both of these are thin front doors onto bin/prometheus-phrasebank, which is
+# where the authoring pass and the runtime picker actually live. They exist
+# because docs/08 promises `prometheus regenerate` by name, and because the
+# whole personality story should be reachable from one command.
+
+def _phrasebank(*args: str) -> int:
+    tool = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                        "prometheus-phrasebank")
+    if not os.path.exists(tool):
+        print("prometheus-phrasebank is not installed", file=sys.stderr)
+        return 1
+    return subprocess.run([tool, *args]).returncode
+
+
+def cmd_regenerate(a) -> int:
+    """Rewrite the phrase bank from persona.md, about-me.md and the spec.
+
+    Minutes, not seconds, and it holds the GPU while it runs — which is fine,
+    because nothing is waiting on it and the result is then free to use all
+    week.
+    """
+    args = ["generate"]
+    for flag, val in (("--events", a.events), ("--variants", a.variants),
+                      ("--register", a.register), ("--model", a.model),
+                      ("--seed", a.seed)):
+        if val is not None:
+            args += [flag, str(val)]
+    for flag, on in (("--no-seeds", a.no_seeds), ("--if-stale", a.if_stale),
+                     ("--quiet", a.quiet)):
+        if on:
+            args.append(flag)
+    return _phrasebank(*args)
+
+
+def cmd_phrase(a) -> int:
+    """One phrasing for an event — the runtime path, no model involved."""
+    if a.show:
+        return _phrasebank("show", *( [a.event] if a.event else [] ),
+                           *(["--all"] if a.all else []))
+    if not a.event:
+        return _phrasebank("status")
+    args = ["pick", a.event, "-n", str(a.count)]
+    for kv in a.slot or []:
+        args += ["--slot", kv]
+    if a.dry:
+        args.append("--dry")
+    if not a.say:
+        return _phrasebank(*args)
+
+    tool = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                        "prometheus-phrasebank")
+    out = subprocess.run([tool, *args], capture_output=True, text=True)
+    rc = out.returncode
+    for line in out.stdout.splitlines():
+        if line.strip():
+            print(line)
+            send({"text": line.strip(), "priority": "ambient", "category": "ambient"})
+            time.sleep(0.2)
+    return rc
+
+
+def _own_processes() -> list[tuple[str, int, str]]:
+    """The resident daemons (prometheusd, prometheus-hypr) and the children
+    prometheusd owns (piper, paplay).
+
+    Matched by argv[0]/parentage rather than a substring of the whole command
+    line, so an unrelated shell that merely mentions "prometheusd" — a grep, an
+    editor, this script — is never miscounted.
+    """
+    daemons, children, out = set(), [], []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = f.read().split(b"\0")
+            if not argv or not argv[0]:
+                continue
+            with open(f"/proc/{pid}/stat") as f:
+                stat = f.read()
+            ppid = int(stat.split(") ", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        exe = os.path.basename(argv[0].decode(errors="replace"))
+        script = os.path.basename(argv[1].decode(errors="replace")) if len(argv) > 1 and argv[1] else ""
+        name = script if script in DAEMON_NAMES else (exe if exe in DAEMON_NAMES else None)
+        if name:
+            daemons.add(pid)
+            out.append((pid, _rss(pid), name))
+        else:
+            children.append((pid, str(ppid), exe))
+    for pid, ppid, exe in children:
+        if ppid in daemons:
+            out.append((pid, _rss(pid), exe))
+    return sorted(out, key=lambda r: int(r[0]))
+
+
+def _rss(pid: str) -> int:
+    """RSS in KB."""
+    try:
+        with open(f"/proc/{pid}/statm") as f:
+            return int(f.read().split()[1]) * (os.sysconf("SC_PAGE_SIZE") // 1024)
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+# -- voice audition (build plan task 0.10) ---------------------------------
+
+CANDIDATES = [
+    ("en_GB-northern_english_male-medium", "en/en_GB/northern_english_male/medium"),
+    ("en_GB-alba-medium",                  "en/en_GB/alba/medium"),
+    ("en_GB-cori-high",                    "en/en_GB/cori/high"),
+    ("en_GB-jenny_dioco-medium",           "en/en_GB/jenny_dioco/medium"),
+    ("en_GB-semaine-medium",               "en/en_GB/semaine/medium"),
+    ("en_US-lessac-medium",                "en/en_US/lessac/medium"),
+]
+VOICE_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
+AUDITION_LINE = ("I've finished. Changed the auth middleware and the two tests "
+                 "that covered it.")
+
+# What each voice calls itself when auditioning with --announce. The model
+# names carry the corpus they were trained on ("jenny_dioco"), which is not
+# what you'd call the voice out loud.
+SPOKEN_NAMES = {
+    "en_GB-alan-medium": "Alan",
+    "en_GB-northern_english_male-medium": "the northern English voice",
+    "en_GB-alba-medium": "Alba",
+    "en_GB-cori-high": "Cori",
+    "en_GB-jenny_dioco-medium": "Jenny",
+    "en_GB-semaine-medium": "Semaine",
+    "en_US-lessac-medium": "Lessac",
+}
+
+
+def spoken_name(model: str) -> str:
+    if model in SPOKEN_NAMES:
+        return SPOKEN_NAMES[model]
+    stem = model.split("-", 1)[-1]
+    for q in ("-x_low", "-low", "-medium", "-high"):
+        if stem.endswith(q):
+            stem = stem[: -len(q)]
+            break
+    return stem.replace("_", " ").capitalize()
+
+
+def voices_dir() -> str:
+    return os.path.join(HOME, ".local/share/piper/voices")
+
+
+def cmd_audition(a) -> int:
+    installed = {f[:-5] for f in os.listdir(voices_dir())
+                 if f.endswith(".onnx")} if os.path.isdir(voices_dir()) else set()
+    if a.list:
+        print("installed:")
+        for v in sorted(installed):
+            print(f"  {v}")
+        print("\ncandidates for the agent voice:")
+        for name, _ in CANDIDATES:
+            print(f"  {'[installed]' if name in installed else '[  fetch  ]'} {name}")
+        return 0
+
+    names = a.voices or [n for n, _ in CANDIDATES]
+    if a.fetch:
+        for name in names:
+            if name in installed:
+                continue
+            path = dict(CANDIDATES).get(name)
+            if not path:
+                print(f"unknown candidate {name}", file=sys.stderr)
+                continue
+            if not fetch_voice(name, path):
+                return 1
+        installed = {f[:-5] for f in os.listdir(voices_dir()) if f.endswith(".onnx")}
+
+    text = a.text or AUDITION_LINE
+    system = "en_GB-alan-medium"
+
+    # The judgement isn't "is this voice nice" — it's "can I tell instantly
+    # whether this is the machine or the agent talking". So the system voice is
+    # replayed immediately before each candidate, back to back.
+    def line_for(model: str) -> str:
+        if not a.announce:
+            return text
+        return f"This is {spoken_name(model)}. {text}"
+
+    if not a.no_reference and system in installed:
+        print(f"\n    reference — the system voice you already have")
+        print(f"    {system}")
+        speak_direct(system, line_for(system))
+        time.sleep(0.6)
+
+    for i, name in enumerate(names, 1):
+        if name == system:
+            continue
+        if name not in installed:
+            print(f"  ({i}) skipping {name} — not installed; run with --fetch")
+            continue
+        print(f"\n>>> ({i}) {name}")
+        print(f"    {line_for(name)}")
+        speak_direct(name, line_for(name))
+        time.sleep(0.5)
+        if not a.no_reference and system in installed:
+            print(f"    ...against {system}")
+            speak_direct(system, line_for(system))
+            time.sleep(0.6)
+
+    print("\n" + "-" * 68)
+    print("To use one, set it in " + os.path.join(CONFIG_DIR, "config.json") + ":")
+    print('    "agent": { "model": "<name>", "length_scale": 0.7, "enabled": true }')
+    print("It hot-reloads — no restart needed. Re-hear any one with:")
+    print("    prometheus audition <name>")
+    return 0
+
+
+def fetch_voice(name: str, path: str) -> bool:
+    os.makedirs(voices_dir(), exist_ok=True)
+    for suffix in (".onnx", ".onnx.json"):
+        url = f"{VOICE_BASE}/{path}/{name}{suffix}?download=true"
+        dest = os.path.join(voices_dir(), name + suffix)
+        if os.path.exists(dest):
+            continue
+        print(f"fetching {name}{suffix} ...")
+        rc = subprocess.run(["curl", "-fsSL", "--retry", "2", "-o", dest, url]).returncode
+        if rc != 0:
+            print(f"  failed to fetch {url}", file=sys.stderr)
+            if os.path.exists(dest):
+                os.unlink(dest)
+            return False
+    return True
+
+
+def speak_direct(model_name: str, text: str) -> None:
+    """Audition path only — deliberately bypasses the broker.
+
+    ADR-0001 says one process owns the audio device; auditioning voices is an
+    offline, interactive act with the daemon typically stopped, so it is the
+    one sanctioned exception.
+    """
+    model = os.path.join(voices_dir(), model_name + ".onnx")
+    piper = subprocess.Popen(
+        ["/opt/piper-tts/piper", "--model", model, "--output_raw",
+         "--length_scale", "0.7", "--sentence_silence", "0.2",
+         "--espeak_data", "/opt/piper-tts/espeak-ng-data"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    play = subprocess.Popen(
+        ["paplay", "--raw", "--rate=22050", "--channels=1", "--format=s16le",
+         "--client-name=prometheus-audition"],
+        stdin=piper.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    piper.stdout.close()
+    piper.stdin.write(text.encode())
+    piper.stdin.close()
+    piper.wait()
+    play.wait()
+
+
+# --------------------------------------------------------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="prometheus", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("say", help="submit a speech intent")
+    p.add_argument("text", nargs="+")
+    p.add_argument("-p", "--priority", default="normal",
+                   choices=["critical", "normal", "ambient", "debug"])
+    p.add_argument("-c", "--category", default="manual")
+    p.add_argument("--dedup-key", default=None)
+    p.add_argument("--ttl", type=int, default=0, metavar="MS")
+    p.add_argument("--preempt", action="store_true")
+    p.add_argument("--wait", action="store_true",
+                   help="wait for the daemon to report the outcome")
+    p.set_defaults(func=cmd_say)
+
+    for name, fn, helptext in (
+        ("stop", cmd_stop, "shut up: flush the queue and cut the current utterance"),
+        ("reload", cmd_reload, "re-read config.json now"),
+        ("on", cmd_on, "power on (starts the systemd units)"),
+        ("off", cmd_off, "power off (stops every process, frees VRAM)"),
+        ("toggle", cmd_toggle, "flip the power switch"),
+        ("status", cmd_status, "show state, units, processes and RSS"),
+    ):
+        sp = sub.add_parser(name, help=helptext)
+        sp.set_defaults(func=fn)
+
+    p = sub.add_parser("verbosity", help="get, set or cycle verbosity")
+    p.add_argument("level", nargs="?", choices=[*VERBOSITIES, "cycle"])
+    p.set_defaults(func=cmd_verbosity)
+
+    p = sub.add_parser("log", help="tail the daemon log")
+    p.add_argument("-f", "--follow", action="store_true")
+    p.add_argument("-n", "--lines", type=int, default=40)
+    p.add_argument("--file", action="store_true",
+                   help="read the structured JSONL log instead of the journal")
+    p.add_argument("--hypr", action="store_true",
+                   help="tail prometheus-hypr's log instead of prometheusd's")
+    p.set_defaults(func=cmd_log)
+
+    p = sub.add_parser("transcript",
+                       help="everything said to and by the system")
+    p.add_argument("-f", "--follow", action="store_true")
+    p.add_argument("-n", "--lines", type=int, default=40)
+    p.add_argument("--raw", action="store_true", help="raw JSONL")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="show category and priority")
+    p.add_argument("--spoken-only", action="store_true",
+                   help="hide intents that were dropped")
+    p.set_defaults(func=cmd_transcript)
+
+    p = sub.add_parser("journal", help="the filtered Hyprland event history (Phase 1)")
+    p.add_argument("-f", "--follow", action="store_true")
+    p.add_argument("-n", "--lines", type=int, default=40)
+    p.add_argument("--raw", action="store_true", help="raw JSONL")
+    p.set_defaults(func=cmd_journal)
+
+    p = sub.add_parser("brief",
+                       help="summarize the journal since the last brief")
+    p.add_argument("--print", dest="print_only", action="store_true",
+                   help="print instead of speaking")
+    p.add_argument("--no-llm", action="store_true",
+                   help="skip synthesis, speak the plain template")
+    p.add_argument("--digest", action="store_true",
+                   help="print the facts handed to the model, and stop")
+    p.set_defaults(func=cmd_brief)
+
+    p = sub.add_parser("feedback",
+                       help="note what you just thought, with the evidence attached")
+    p.add_argument("note", nargs="*")
+    p.add_argument("--list", action="store_true", help="read back what you've noted")
+    p.add_argument("-n", "--lines", type=int, default=20)
+    p.set_defaults(func=cmd_feedback)
+
+    p = sub.add_parser("regenerate",
+                       help="rewrite the phrase bank from persona.md and about-me.md")
+    p.add_argument("--events", default=None, help="comma-separated subset")
+    p.add_argument("--variants", type=int, default=None,
+                   help="override the per-event target")
+    p.add_argument("--register", default=None, choices=["terse", "neutral", "warm"])
+    p.add_argument("--model", default=None, help="override the authoring model")
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--no-seeds", action="store_true",
+                   help="bank only what the model writes")
+    p.add_argument("--if-stale", action="store_true",
+                   help="do nothing unless the bank no longer matches its inputs")
+    p.add_argument("-q", "--quiet", action="store_true")
+    p.set_defaults(func=cmd_regenerate)
+
+    p = sub.add_parser("phrase", help="one phrasing from the bank (no model loaded)")
+    p.add_argument("event", nargs="?")
+    p.add_argument("--slot", action="append", metavar="K=V")
+    p.add_argument("-n", "--count", type=int, default=1)
+    p.add_argument("--say", action="store_true", help="speak it as well as printing it")
+    p.add_argument("--dry", action="store_true", help="don't record it as used")
+    p.add_argument("--show", action="store_true", help="list what the bank holds")
+    p.add_argument("--all", action="store_true", help="with --show, print every phrasing")
+    p.set_defaults(func=cmd_phrase)
+
+    p = sub.add_parser("name", help="show or set what you call it")
+    p.add_argument("name", nargs="*")
+    p.add_argument("--spoken-as", default=None,
+                   help="respelling used only for speech, when Piper mispronounces it")
+    p.add_argument("-q", "--quiet", action="store_true", help="don't speak it back")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="skip the spoken confirmation (for scripts)")
+    p.add_argument("--voice", default=None,
+                   help="also set the agent voice to this Piper model")
+    p.add_argument("--system-voice", default=None,
+                   help="also change the PRIMARY voice, which config.json marks locked")
+    p.set_defaults(func=cmd_name)
+
+    p = sub.add_parser("name-detect", help=argparse.SUPPRESS)
+    p.add_argument("text", nargs="+")
+    p.set_defaults(func=cmd_name_detect)
+
+    p = sub.add_parser("voice", help="switch between one voice and two")
+    p.add_argument("action", nargs="?", choices=["single", "dual", "set"])
+    p.add_argument("model", nargs="?")
+    p.set_defaults(func=cmd_voice)
+
+    p = sub.add_parser("audition", help="hear candidate second voices")
+    p.add_argument("voices", nargs="*")
+    p.add_argument("--list", action="store_true")
+    p.add_argument("--fetch", action="store_true", help="download missing candidates")
+    p.add_argument("--text", default=None)
+    p.add_argument("--announce", action="store_true",
+                   help="each voice says its own name first")
+    p.add_argument("--no-reference", action="store_true",
+                   help="don't replay the system voice between candidates")
+    p.set_defaults(func=cmd_audition)
+
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
