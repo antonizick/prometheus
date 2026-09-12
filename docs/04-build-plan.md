@@ -236,7 +236,7 @@ The phase that decides whether this gets used or turned off.
 | 5.4 | Context gates: screen locked, fullscreen, other audio playing | ✅ |
 | 5.5 | Migrate `omarchy-tts-read-cursor` / `-terminal-live` to route via the broker | ✅ |
 | 5.6 | Re-measure overhead; update [07](07-resource-profile.md) with real numbers | ✅ |
-| 5.7 | Write the operator's manual (`docs/08-operating.md`) | ☐ not started |
+| 5.7 | Write the operator's manual ([11-living-with-it.md](11-living-with-it.md)) | ✅ |
 
 **Built 2026-09-12** — see [notes/2026-09-12-phase-5.md](../notes/2026-09-12-phase-5.md).
 

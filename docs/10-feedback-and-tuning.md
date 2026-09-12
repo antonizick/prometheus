@@ -6,6 +6,13 @@ for as long as you live with it afterwards.
 Everything here is a file you edit or a command you run. Nothing in this
 document requires a rebuild, and nothing requires me.
 
+> **This document is the narrative — how to think about tuning, which layer is
+> wrong, what to do at a week and a month.**
+> [11-living-with-it.md](11-living-with-it.md) is the *reference*: the day-one
+> checklist, every dial with its exact JSON path and type, and the precise
+> mechanics of each feedback channel. Reach for 11 when you need a key name;
+> read 10 when you need to work out which dial you actually want.
+
 ---
 
 ## The two rules that make the rest work
