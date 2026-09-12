@@ -210,7 +210,14 @@ on tolerable.
 ### What to do at a week, a month, six months
 
 **After a week.** You will have a handful of `prometheus feedback` notes and a
-real journal. Read them together:
+real journal. **One question is already waiting for you at this point**, parked
+deliberately rather than guessed at:
+
+> `speak.claude_finished.min_turn_secs` is `0`, so it speaks after *every*
+> Claude Code turn. If that has been grating, raise it — 60 means it only
+> speaks when you have plausibly looked away. If it hasn't, leave it.
+
+Read your notes and the replay together:
 
 ```bash
 prometheus feedback --list

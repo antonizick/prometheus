@@ -209,6 +209,7 @@ The phase that decides whether this gets used or turned off.
 | # | Task |
 |---|---|
 | 5.1 | Tune from real journal data — what was spoken that shouldn't have been? |
+| 5.1a | **Revisit `speak.claude_finished.min_turn_secs`** — deferred from Phase 3 on purpose. Currently `0`, so it speaks after every Claude turn; almost certainly too chatty, but the right number is found by ear, not by guessing. Evidence: `prometheus feedback --list`, `prometheus transcript -v` |
 | 5.2 | Verbosity profiles: quiet / normal / chatty |
 | 5.3 | Voice and tone pass (see [06](06-voice-and-tone.md)) — listened to, not read |
 | 5.4 | Context gates: screen locked, fullscreen, other audio playing |

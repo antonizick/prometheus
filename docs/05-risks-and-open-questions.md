@@ -96,6 +96,22 @@ My instinct: **only** "Claude is waiting" and "a long command failed" deserve
 unprompted speech. Everything else belongs in the briefing. But this is a
 preference question, not a technical one.
 
+**Deferred, deliberately — 2026-09-11.** One sub-question inside Q1 is live
+right now and is being left alone on purpose:
+
+> `speak.claude_finished` is `enabled: true` with **`min_turn_secs: 0`**, which
+> means it speaks after *every* Claude Code turn — including two-second ones
+> you are sitting there watching.
+
+That is very likely too much. It stays as-is anyway, because the honest way to
+find the right number is to hear it wrong a few times, not to guess in advance.
+**Revisit after a week or two of real use** (Phase 5.1), with
+`prometheus feedback --list` and `prometheus transcript` as the evidence.
+
+Phase 3 must therefore *honour* `min_turn_secs` in code even though it is
+currently zero, so changing it later is a config edit and never a rebuild —
+[08](08-personality-and-config.md), "nothing is baked in".
+
 ### Q2 — Terminal output capture: how much do you want?
 Reliable capture in a plain terminal is the one genuinely awkward part.
 **Note: tmux isn't currently running**, so the existing live-read feature does
