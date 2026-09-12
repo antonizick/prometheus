@@ -160,17 +160,29 @@ was the wrong target in the first place — is in
 
 ---
 
-## Phase 3 — Claude Code integration *(highest value)*
+## Phase 3 — Claude Code integration *(highest value)* ✅ **BUILT**
+
+**Status (2026-09-11):** tasks 3.1-3.7 complete. See
+[notes/2026-09-11-phase-3.md](../notes/2026-09-11-phase-3.md) and
+[experiments/hook-schema-findings.md](../experiments/hook-schema-findings.md)
+(task 3.1's verification, including where a cold LLM guess at the payload
+schema turned out half-fabricated). One deliberate deviation from 3.3's
+literal wording: the real `Stop` payload carries `last_assistant_message`
+directly, confirmed by live capture, so the handler reads that rather than
+opening the transcript file — simpler, and avoids the transcript's documented
+async-write lag entirely. `bin/prometheus-claude` is the single binary for
+both hooks; wired into `~/.claude/settings.json` (`"async": true`, `"timeout":
+20`) by `install.sh`, which now also manages that file idempotently.
 
 | # | Task |
 |---|---|
-| 3.1 | **Verify actual hook payload schema** — log raw stdin from each hook first |
-| 3.2 | `Notification` hook → `critical` priority ("Claude is waiting for you") |
-| 3.3 | `Stop` hook → read transcript, extract final assistant message |
-| 3.4 | Short-circuit: messages < 25 words spoken directly, no LLM |
-| 3.5 | Longer messages → summarizer |
-| 3.6 | Strip code blocks, paths, markdown before speech |
-| 3.7 | Multi-session disambiguation — which project is talking? |
+| 3.1 | **Verify actual hook payload schema** — log raw stdin from each hook first ✅ |
+| 3.2 | `Notification` hook → `critical` priority ("Claude is waiting for you") ✅ |
+| 3.3 | `Stop` hook → read transcript, extract final assistant message ✅ (via `last_assistant_message`, not the transcript file — see above) |
+| 3.4 | Short-circuit: messages < 25 words spoken directly, no LLM ✅ `speak.claude_finished.short_circuit_words` |
+| 3.5 | Longer messages → summarizer ✅ |
+| 3.6 | Strip code blocks, paths, markdown before speech ✅ |
+| 3.7 | Multi-session disambiguation — which project is talking? ✅ best-effort `/proc` scan, see notes |
 
 **Acceptance:**
 - Walking away from a blocked agent session gets you told about it

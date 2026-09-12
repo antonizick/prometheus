@@ -6,9 +6,11 @@ a Linux desktop that decides *what is worth saying* — and says almost nothing.
 No cloud, no API keys, no ongoing cost. Everything runs on the machine it talks
 about.
 
-> **Status:** Phases 0–2 built and measured. The speech broker, event journal,
-> briefings, local-LLM summarizer and the offline phrase bank are working and in
-> daily use. Unprompted narration is deliberately **not** wired up yet — see
+> **Status:** Phases 0–3 built and measured. The speech broker, event journal,
+> briefings, local-LLM summarizer, offline phrase bank, and Claude Code hooks
+> are working and in daily use. General unprompted *desktop* narration is
+> deliberately **not** wired up yet (Phase 5) — Claude Code's own blocked/
+> finished narration is the one push path live so far. See
 > [Status](#status).
 
 ---
@@ -148,16 +150,18 @@ talking mid-word.
 | 0 | Speech broker, toggle, config, resource contract | ✅ built, 13/13 acceptance |
 | 1 | Hyprland event journal, briefings, interest scoring | ✅ built |
 | 2 | Local LLM: summarizer, LLM briefings, phrase bank | ✅ built, bank approved by ear |
-| 3 | Claude Code integration | next |
-| 4 | Shell integration | planned |
+| 3 | Claude Code integration — `Stop`/`Notification` hooks | ✅ built |
+| 4 | Shell integration | next |
 | 5 | Living with it — tuning from real data | planned |
 | 6 | Two-way conversation | speculative |
 
-**There is deliberately no unprompted desktop narration yet.** Phase 1 collects
-evidence without speaking, so that when narration is switched on, the policy can
-be tuned against a real week of events rather than a guess.
+**There is deliberately no unprompted *desktop* narration yet.** Phase 1
+collects evidence without speaking, so that when narration is switched on, the
+policy can be tuned against a real week of events rather than a guess.
 `experiments/replay-scoring.py` replays that history and reports what *would*
-have been said.
+have been said. Claude Code's own push events (blocked / finished) are the one
+exception, live since Phase 3 — narrow enough in scope (docs/01: "push only
+what can't wait") that it didn't need that same evidence-first treatment.
 
 ## Requirements
 

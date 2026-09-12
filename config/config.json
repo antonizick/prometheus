@@ -121,7 +121,8 @@
 
   "speak": {
     "claude_blocked":    { "enabled": true,  "priority": "critical" },
-    "claude_finished":   { "enabled": true,  "priority": "normal",  "min_turn_secs": 0 },
+    "claude_finished":   { "enabled": true,  "priority": "normal",  "min_turn_secs": 0,
+                          "short_circuit_words": 25 },
     "command_failed":    { "enabled": true,  "priority": "normal",  "min_duration_secs": 10 },
     "command_succeeded": { "enabled": false, "min_duration_secs": 30 },
     "desktop_activity":  { "enabled": true,  "priority": "ambient", "target_rate": 0.15 }
