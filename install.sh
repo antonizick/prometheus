@@ -13,7 +13,7 @@ BIN_DIR="$HOME/.local/bin"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/prometheus"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/prometheus"
-BINARIES=(prometheusd prometheus prometheus-toggle prometheus-boot prometheus-hypr prometheus-llm prometheus-phrasebank prometheus-claude)
+BINARIES=(prometheusd prometheus prometheus-toggle prometheus-boot prometheus-hypr prometheus-llm prometheus-phrasebank prometheus-claude prometheus-shell)
 UNITS=(prometheus.target prometheusd.service prometheus-boot.service prometheus-hypr.service prometheus-ollama.service)
 
 if [[ "${1:-}" == "--uninstall" ]]; then
@@ -77,6 +77,23 @@ else
   echo "    jq not found — skipped; wire manually, see docs/01-architecture.md"
 fi
 
+echo "==> shell integration -> ~/.bashrc"
+BASHRC="$HOME/.bashrc"
+SOURCE_LINE="source \"$REPO/shell/prometheus.bash\""
+if [[ -f "$BASHRC" ]] && grep -qF "$SOURCE_LINE" "$BASHRC"; then
+  echo "    already wired (kept — yours)"
+elif [[ -f "$BASHRC" ]]; then
+  cp "$BASHRC" "$BASHRC.prometheus-bak-$(date +%Y%m%d%H%M%S)"
+  {
+    echo ""
+    echo "# Prometheus shell integration (Phase 4) — see shell/prometheus.bash"
+    echo "$SOURCE_LINE"
+  } >> "$BASHRC"
+  echo "    added (backup saved alongside .bashrc; open a new shell to pick it up)"
+else
+  echo "    no ~/.bashrc found — skipped; add manually: $SOURCE_LINE"
+fi
+
 systemctl --user daemon-reload
 systemctl --user enable prometheusd.service >/dev/null      # WantedBy=prometheus.target
 systemctl --user enable prometheus-hypr.service >/dev/null  # WantedBy=prometheus.target
@@ -95,6 +112,8 @@ Installed.
   prometheus status        what's running and what it costs
   prometheus regenerate    write the phrase bank (offline, a few minutes)
   prometheus phrase --show what it has to say, and how many ways
+  pr make test             opt-in: run + summarize a command's output
 
+Open a new shell (or \`source ~/.bashrc\`) to pick up the shell integration.
 Add the keybinds:   see $REPO/README.md
 EOF

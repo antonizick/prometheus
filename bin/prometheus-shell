@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""prometheus-shell — terminal result narrator (Phase 4).
+
+Invoked by shell/prometheus.bash, never directly by a person. Two subcommands,
+matching the two modes in docs/01-architecture.md ("prometheus-shell"):
+
+  prometheus-shell exit-code CMD EXIT_CODE DURATION_MS
+      Mode A. No output capture, no LLM. Speaks only when a command was
+      long-running or failed — everything else, including every fast
+      success, is silence. Gated by config.json's speak.command_failed /
+      speak.command_succeeded (enabled, min_duration_secs, priority).
+
+  prometheus-shell pr CMD EXIT_CODE DURATION_MS OUTPUT_FILE
+      Mode B, opt-in via the `pr` wrapper function. Reads the tail of
+      OUTPUT_FILE (deleting it afterward — this process is its only reader),
+      hands it to `prometheus-llm summarize`, and speaks whatever comes back.
+      Always attempts to speak regardless of duration: typing `pr` is itself
+      the opt-in signal docs/01 describes, so there is no separate silence
+      threshold to apply on top of it.
+
+Always launched by the bash hook with `&` and `disown` (see shell/
+prometheus.bash) — this process's own runtime is never on the shell's
+critical path, but it still degrades to silence rather than raising on any
+failure (dead socket, unreachable Ollama, missing phrase bank), for the same
+reason bin/prometheus-claude does: a background process that crashes loudly
+into the user's terminal would itself be the annoyance this project exists to
+avoid.
+
+Every invocation is logged to ~/.local/state/prometheus/prometheus-shell.log
+— event, outcome, reason, and a preview of the command and what (if anything)
+was spoken.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.environ.get("PROMETHEUS_CONFIG_DIR") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or f"{HOME}/.config", "prometheus"
+)
+STATE_DIR = os.environ.get("PROMETHEUS_STATE_DIR") or os.path.join(
+    os.environ.get("XDG_STATE_HOME") or f"{HOME}/.local/state", "prometheus"
+)
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+PROMETHEUS_BIN = os.path.join(SCRIPT_DIR, "prometheus")
+PHRASEBANK_BIN = os.path.join(SCRIPT_DIR, "prometheus-phrasebank")
+LLM_BIN = os.path.join(SCRIPT_DIR, "prometheus-llm")
+
+# Relevance decays fast for a result you already glanced away from — long
+# enough to survive a brief queue backlog, short enough that a result never
+# gets announced well after the fact (same reasoning as prometheus-claude's
+# claude_blocked ttl, just a little longer since a shell result is less
+# time-critical than "Claude needs you").
+RESULT_TTL_MS = 30_000
+
+# `pr` output can be huge (a verbose test run); this is what actually reaches
+# the summarizer. prometheus-llm sends stdin to the model unmodified with no
+# truncation of its own, so capping it here is what keeps a big log from
+# blowing the runtime model's context or the 4s summarize timeout.
+MAX_TAIL_LINES = 200
+MAX_TAIL_CHARS = 6000
+
+DEFAULT_CONFIG = {
+    "log_level": "info",
+    "logging": {"file_enabled": True, "file_level": "debug", "max_bytes": 4194304},
+    "speak": {
+        "command_failed":    {"enabled": True,  "priority": "normal", "min_duration_secs": 10},
+        "command_succeeded": {"enabled": False, "priority": "normal", "min_duration_secs": 30},
+    },
+}
+
+
+# --------------------------------------------------------------------------
+# config + logging (same shape as bin/prometheus-claude, bin/prometheus-hypr)
+# --------------------------------------------------------------------------
+
+def deep_merge(base: dict, over: dict) -> dict:
+    out = dict(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def strip_jsonc(text: str) -> str:
+    out, in_str, esc, i = [], False, False, 0
+    while i < len(text):
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+            out.append(c)
+        elif c == "/" and i + 1 < len(text) and text[i + 1] == "/":
+            while i < len(text) and text[i] != "\n":
+                i += 1
+            continue
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_FILE) as f:
+            raw = json.loads(strip_jsonc(f.read()))
+    except FileNotFoundError:
+        return dict(DEFAULT_CONFIG)
+    except (OSError, ValueError):
+        return dict(DEFAULT_CONFIG)
+    return deep_merge(DEFAULT_CONFIG, raw)
+
+
+LEVELS = {"debug": 0, "info": 1, "warn": 2, "error": 3}
+
+
+class Log:
+    def __init__(self) -> None:
+        self.level = LEVELS["info"]
+        self.file_level = LEVELS["debug"]
+        self.file_path: str | None = os.path.join(STATE_DIR, "prometheus-shell.log")
+        self.max_bytes = 4 * 1024 * 1024
+        self._lock = threading.Lock()
+
+    def configure(self, cfg: dict) -> None:
+        lg = cfg.get("logging", {})
+        self.level = LEVELS.get(cfg.get("log_level", "info"), LEVELS["info"])
+        self.file_level = LEVELS.get(lg.get("file_level", "debug"), LEVELS["debug"])
+        self.max_bytes = int(lg.get("max_bytes", 4 * 1024 * 1024))
+        self.file_path = (
+            os.path.join(STATE_DIR, "prometheus-shell.log") if lg.get("file_enabled", True) else None
+        )
+
+    def emit(self, level: str, event: str, msg: str = "", **fields) -> None:
+        lv = LEVELS[level]
+        now = time.time()
+        if lv >= self.level and sys.stderr.isatty():
+            parts = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+            line = f"{time.strftime('%H:%M:%S', time.localtime(now))} {level.upper():<5} {event}"
+            if msg:
+                line += f": {msg}"
+            if parts:
+                line += "  " + parts
+            print(line, file=sys.stderr)
+        if lv >= self.file_level and self.file_path:
+            rec = {"t": round(now, 3), "level": level, "event": event}
+            if msg:
+                rec["msg"] = msg
+            rec.update({k: v for k, v in fields.items() if v is not None})
+            with self._lock:
+                try:
+                    os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
+                    with open(self.file_path, "a") as f:
+                        f.write(json.dumps(rec, default=str) + "\n")
+                        if f.tell() >= self.max_bytes:
+                            os.replace(self.file_path, self.file_path + ".1")
+                except OSError:
+                    pass
+
+    def debug(self, event, msg="", **f): self.emit("debug", event, msg, **f)
+    def info(self, event, msg="", **f): self.emit("info", event, msg, **f)
+    def warn(self, event, msg="", **f): self.emit("warn", event, msg, **f)
+    def error(self, event, msg="", **f): self.emit("error", event, msg, **f)
+
+
+LOG = Log()
+
+
+def preview(text: str, n: int = 150) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= n else text[:n] + "…"
+
+
+# --------------------------------------------------------------------------
+# speaking — shell out to the existing CLIs, same reasoning as
+# bin/prometheus-claude: dedup/rate-limit/mic-gate/voice-mapping all stay
+# owned by prometheusd and bin/prometheus, never duplicated here.
+# --------------------------------------------------------------------------
+
+def say(text: str, priority: str, ttl_ms: int | None = None) -> None:
+    if not text:
+        return
+    args = [PROMETHEUS_BIN, "say", text, "-p", priority, "-c", "shell"]
+    if ttl_ms:
+        args += ["--ttl", str(ttl_ms)]
+    try:
+        subprocess.run(args, timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        LOG.warn("say.failed", str(e))
+
+
+def phrase(event: str, slots: dict | None = None) -> str | None:
+    args = [PHRASEBANK_BIN, "pick", event]
+    for k, v in (slots or {}).items():
+        args += ["--slot", f"{k}={v}"]
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        LOG.warn("phrase.failed", str(e), bank_event=event)
+        return None
+    if out.returncode != 0:
+        LOG.warn("phrase.miss", "no phrasebank entry or bank missing", bank_event=event)
+        return None
+    line = out.stdout.strip()
+    return line or None
+
+
+def summarize(text: str) -> str | None:
+    try:
+        out = subprocess.run([LLM_BIN, "summarize", "-c", "shell"],
+                              input=text, capture_output=True, text=True, timeout=8)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        LOG.warn("summarize.failed", str(e))
+        return None
+    line = out.stdout.strip()
+    return line or None
+
+
+# --------------------------------------------------------------------------
+# friendly command categories — the bank's {command} slot wants a singular
+# noun phrase ("the build", "the tests"), not a literal shell command line
+# (which docs/06 forbids speaking aloud at all: "never read out what can't
+# be heard"). A small substring heuristic over the known categories in
+# config/phrasebank-spec.json, with a generic fallback for anything else.
+# --------------------------------------------------------------------------
+
+_COMMAND_CATEGORIES = (
+    (("test",), "the tests"),
+    (("build", "compile", "make"), "the build"),
+    (("install", "pacman", "apt ", "pip install", "npm i", "cargo add"), "the install"),
+    (("deploy", "publish"), "the deploy"),
+)
+
+
+def command_phrase(cmd: str) -> str:
+    low = cmd.lower()
+    for keywords, friendly in _COMMAND_CATEGORIES:
+        if any(k in low for k in keywords):
+            return friendly
+    return "the command"
+
+
+_ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+         "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+         "eighteen", "nineteen"]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty"]
+
+
+def _int_to_words(n: int) -> str:
+    if n < 20:
+        return _ONES[n]
+    if n < 60:
+        tens, ones = divmod(n, 10)
+        return _TENS[tens] + (f"-{_ONES[ones]}" if ones else "")
+    return str(n)  # unreached given how humanize_duration buckets, but never wrong to fall back
+
+
+def humanize_duration(secs: float) -> str:
+    """Speakable, per docs/06 rule 5: 'forty seconds', never '38.2s'."""
+    secs = max(0.0, secs)
+    if secs < 60:
+        n = max(5, int(round(secs / 5.0)) * 5)
+        return f"{_int_to_words(n)} second{'s' if n != 1 else ''}"
+    minutes = secs / 60.0
+    if minutes < 90:
+        n = max(1, round(minutes))
+        return f"{_int_to_words(n)} minute{'s' if n != 1 else ''}"
+    n = max(1, round(minutes / 60.0))
+    return f"{_int_to_words(n)} hour{'s' if n != 1 else ''}"
+
+
+# --------------------------------------------------------------------------
+# Mode A — exit-code narration
+# --------------------------------------------------------------------------
+
+def handle_exit_code(cmd: str, exit_code: int, duration_secs: float, cfg: dict) -> None:
+    failed = exit_code != 0
+    sc = cfg["speak"]["command_failed" if failed else "command_succeeded"]
+    kind = "failed" if failed else "succeeded"
+
+    if not sc.get("enabled", failed):
+        LOG.debug(f"{kind}.disabled", cmd=preview(cmd))
+        return
+
+    min_dur = float(sc.get("min_duration_secs", 0))
+    if duration_secs < min_dur:
+        LOG.debug(f"{kind}.too_short", cmd=preview(cmd), exit_code=exit_code,
+                  duration_secs=round(duration_secs, 1), min_duration_secs=min_dur)
+        return
+
+    friendly = command_phrase(cmd)
+    if failed:
+        bank_event = "command_failed"
+        line = phrase(bank_event, {"command": friendly})
+        fallback = f"{friendly[0].upper()}{friendly[1:]} failed."
+    else:
+        bank_event = "command_succeeded_long"
+        line = phrase(bank_event, {"command": friendly, "duration": humanize_duration(duration_secs)})
+        fallback = f"{friendly[0].upper()}{friendly[1:]} finished."
+
+    if not line:
+        LOG.warn(f"{kind}.no_phrase", "phrase bank miss, using a literal fallback",
+                 bank_event=bank_event)
+        line = fallback
+
+    LOG.info(f"{kind}.spoken", cmd=preview(cmd), exit_code=exit_code, output=line,
+             duration_secs=round(duration_secs, 1), bank_event=bank_event)
+    say(line, sc.get("priority", "normal"), ttl_ms=RESULT_TTL_MS)
+
+
+# --------------------------------------------------------------------------
+# Mode B — pr, opt-in output summarization
+# --------------------------------------------------------------------------
+
+def tail_for_summary(text: str) -> str:
+    lines = text.splitlines()[-MAX_TAIL_LINES:]
+    tail = "\n".join(lines)
+    return tail[-MAX_TAIL_CHARS:]
+
+
+def handle_pr(cmd: str, exit_code: int, duration_secs: float, output_file: str, cfg: dict) -> None:
+    try:
+        with open(output_file, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        LOG.error("pr.read_failed", str(e), output_file=output_file)
+        raw = b""
+    finally:
+        try:
+            os.unlink(output_file)
+        except OSError:
+            pass
+
+    text = raw.decode("utf-8", errors="replace")
+    tail = tail_for_summary(text) if text.strip() else "(no output)"
+    prompt_input = f"Command: {cmd}\nExit code: {exit_code}\n\n{tail}"
+
+    LOG.debug("pr.summarizing", cmd=preview(cmd), exit_code=exit_code,
+             duration_secs=round(duration_secs, 1), output_bytes=len(raw))
+
+    summary = summarize(prompt_input)
+    if not summary:
+        LOG.info("pr.silent", "summarizer produced nothing — degrading to silence",
+                 cmd=preview(cmd), exit_code=exit_code)
+        return
+
+    sc = cfg["speak"]["command_failed" if exit_code != 0 else "command_succeeded"]
+    LOG.info("pr.spoken", cmd=preview(cmd), exit_code=exit_code, output=summary,
+             duration_secs=round(duration_secs, 1))
+    say(summary, sc.get("priority", "normal"), ttl_ms=RESULT_TTL_MS)
+
+
+# --------------------------------------------------------------------------
+# entry point
+# --------------------------------------------------------------------------
+
+def main() -> int:
+    cfg = load_config()
+    LOG.configure(cfg)
+
+    p = argparse.ArgumentParser(prog="prometheus-shell")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    ec = sub.add_parser("exit-code")
+    ec.add_argument("command_text")
+    ec.add_argument("exit_code", type=int)
+    ec.add_argument("duration_ms", type=int)
+
+    pr = sub.add_parser("pr")
+    pr.add_argument("command_text")
+    pr.add_argument("exit_code", type=int)
+    pr.add_argument("duration_ms", type=int)
+    pr.add_argument("output_file")
+
+    try:
+        a = p.parse_args()
+    except SystemExit:
+        return 0
+
+    try:
+        if a.cmd == "exit-code":
+            handle_exit_code(a.command_text, a.exit_code, a.duration_ms / 1000.0, cfg)
+        elif a.cmd == "pr":
+            handle_pr(a.command_text, a.exit_code, a.duration_ms / 1000.0, a.output_file, cfg)
+    except Exception as e:
+        # Fail-silent applies to crashes too (docs/05 R9): this always runs
+        # detached from the interactive shell, but a crash must never surface
+        # as noise in the user's terminal.
+        LOG.error("handler.crash", str(e), cmd=a.cmd)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

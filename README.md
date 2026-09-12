@@ -6,12 +6,12 @@ a Linux desktop that decides *what is worth saying* — and says almost nothing.
 No cloud, no API keys, no ongoing cost. Everything runs on the machine it talks
 about.
 
-> **Status:** Phases 0–3 built and measured. The speech broker, event journal,
-> briefings, local-LLM summarizer, offline phrase bank, and Claude Code hooks
-> are working and in daily use. General unprompted *desktop* narration is
-> deliberately **not** wired up yet (Phase 5) — Claude Code's own blocked/
-> finished narration is the one push path live so far. See
-> [Status](#status).
+> **Status:** Phases 0–4 built and measured. The speech broker, event journal,
+> briefings, local-LLM summarizer, offline phrase bank, Claude Code hooks, and
+> shell integration (exit-code narration + the opt-in `pr` wrapper) are all
+> wired in. General unprompted *desktop* narration is deliberately **not**
+> wired up yet (Phase 5) — Claude Code's own blocked/finished narration and
+> shell results are the two push paths live so far. See [Status](#status).
 
 ---
 
@@ -151,7 +151,7 @@ talking mid-word.
 | 1 | Hyprland event journal, briefings, interest scoring | ✅ built |
 | 2 | Local LLM: summarizer, LLM briefings, phrase bank | ✅ built, bank approved by ear |
 | 3 | Claude Code integration — `Stop`/`Notification` hooks | ✅ built |
-| 4 | Shell integration | next |
+| 4 | Shell integration | ✅ built, not yet heard live |
 | 5 | Living with it — tuning from real data | planned |
 | 6 | Two-way conversation | speculative |
 
@@ -170,6 +170,8 @@ Built against one specific machine, and honest about it: an Arch-based
 Nothing here is portable without work.
 
 - **Python 3.11+**, standard library only — no pip install, no virtualenv
+- **Bash 5.0+** for the shell integration (Phase 4) — its command-duration
+  timer relies on `$EPOCHREALTIME`
 - **[Piper](https://github.com/rhasspy/piper)** at `/opt/piper-tts`, with voices
   in `~/.local/share/piper/voices` (`en_GB-alan-medium` and `en_GB-alba-medium`)
 - **PipeWire / PulseAudio** (`paplay`)

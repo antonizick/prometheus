@@ -196,21 +196,30 @@ both hooks; wired into `~/.claude/settings.json` (`"async": true`, `"timeout":
 
 ---
 
-## Phase 4 — Shell integration
+## Phase 4 — Shell integration ✅ **BUILT**
+
+**Status (2026-09-11):** tasks 4.1-4.5 complete. See
+[notes/2026-09-11-phase-4.md](../notes/2026-09-11-phase-4.md). Decision logic and
+CLI wiring verified with `say`/`phrase`/`summarize` mocked out, plus one
+real-binary integration check on inputs guaranteed silent by config (no risk
+of audio); **not yet confirmed by ear** — the phrase-bank wording itself was
+already approved in Phase 2, but a live failed/long-running command hasn't
+actually been heard yet, and Nick asked to be warned before anything audible
+runs.
 
 | # | Task |
 |---|---|
-| 4.1 | `PROMPT_COMMAND` hook: capture command, exit code, duration |
-| 4.2 | Exit-code narration — **only** long-running or failed commands |
-| 4.3 | `pr <command>` opt-in wrapper with output capture |
-| 4.4 | Route captured output through the summarizer |
-| 4.5 | Resolve the tmux question (see [05](05-risks-and-open-questions.md) Q2) |
+| 4.1 | `PROMPT_COMMAND` hook: capture command, exit code, duration ✅ `shell/prometheus.bash` — DEBUG trap + `$EPOCHREALTIME`, no external processes on the command path |
+| 4.2 | Exit-code narration — **only** long-running or failed commands ✅ `bin/prometheus-shell exit-code`, gated by `speak.command_failed` / `speak.command_succeeded` (`enabled`, `min_duration_secs`) |
+| 4.3 | `pr <command>` opt-in wrapper with output capture ✅ tees to `$XDG_RUNTIME_DIR/prometheus/`, preserves the real exit code via `PIPESTATUS[0]` |
+| 4.4 | Route captured output through the summarizer ✅ `bin/prometheus-shell pr` → `prometheus-llm summarize -c shell`, tailed to 200 lines / 6000 chars first |
+| 4.5 | Resolve the tmux question (see [05](05-risks-and-open-questions.md) Q2) ✅ **A + B**, as recommended — exit-code narration is free and always on, `pr` is the opt-in rich path; tmux (C) and full session logging (D) stay out of scope |
 
 **Acceptance:**
-- Fast successful commands produce **silence**
-- A 40-second failure is announced accurately
-- `pr make test` gives a useful spoken summary
-- **Prompt latency increase is unmeasurable** — nothing may slow the shell
+- Fast successful commands produce **silence** ✅ `command_succeeded.enabled: false` by default — every fast-success and (until raised) slow-success case is silent; verified for both in isolation
+- A 40-second failure is announced accurately — ⏳ decision logic verified (mocked), not yet heard live
+- `pr make test` gives a useful spoken summary — ⏳ decision logic verified (mocked), not yet heard live
+- **Prompt latency increase is unmeasurable** ✅ measured: ~10 µs/command baseline vs ~156 µs/command with the hook sourced and Prometheus off (fast-path file read, no fork), ~166 µs/command with Prometheus on (backgrounded fork). All three are 3+ orders of magnitude below anything a person can perceive. `disown`ing the background dispatch also had to be paired with `{ … } 2>/dev/null` — bash's own job-control "[1] PID" notice isn't silenced by redirecting the child's output or by a bare `disown`, and would otherwise have printed after every narrated command
 
 ---
 
