@@ -63,13 +63,49 @@ uninstalled.** That's exactly the requirement.
 
 ### State WARM — toggled on, nothing happening
 
-| Resource | Expected cost | **Measured (Phase 0, single voice)** | **Measured (Phase 1, two voices + hypr)** |
-|---|---|---|---|
-| `prometheusd` | ~10–15 MB RAM, 0 % CPU (blocked on socket read) | **16.9 MB, 0.000 s CPU** | **17.2 MB, 0.000 s CPU** |
-| Warm Piper (x1 or x2) | ~80–100 MB RAM each, 0 % CPU (blocked on stdin) | **100.0 MB, 0.000 s CPU** | **100.2 + 95.5 MB, 0.000 s CPU** |
-| `prometheus-hypr` | ~5–15 MB RAM, 0 % CPU (blocked on socket read) | *(not built yet)* | **15.3 MB, 0.000 s CPU** |
-| **VRAM** | **0 — no model loaded** | **0** ✓ | **0** ✓ |
-| **Total** | — | **116.9 MB, 0.0000 % of one core** | **228.2 MB, 0.0000 % of one core** |
+| Resource | Expected cost | **Phase 0 (1 voice)** | **Phase 1 (2 voices + hypr)** | **Phase 5 (1 voice + narration)** |
+|---|---|---|---|---|
+| `prometheusd` | ~10–15 MB RAM, 0 % CPU (blocked on socket read) | **16.9 MB** | **17.2 MB** | **17.5 MB** |
+| Warm Piper (x1 or x2) | ~80–100 MB RAM each, 0 % CPU (blocked on stdin) | **100.0 MB** | **100.2 + 95.5 MB** | **100.3 MB** |
+| `prometheus-hypr` | ~5–15 MB RAM, 0 % CPU (blocked on socket read) | *(not built yet)* | **15.3 MB** | **25.1 MB** |
+| **VRAM** | **0 — no model loaded** | **0** ✓ | **0** ✓ | **0** ✓ |
+| **Total** | — | **116.9 MB** | **228.2 MB** | **142.8 MB** |
+
+> **Phase 5 note — where the extra 10 MB went, and the headroom it costs.**
+> `prometheus-hypr` grew from 15.3 MB to **25.1 MB** when ambient narration was
+> switched on. That is the phrase bank held resident (278 phrasings) plus the
+> attention scorer. It buys the thing the design is built on: picking a phrasing
+> stays a dictionary lookup with **no model loaded and no VRAM held**, exactly
+> as [08](08-personality-and-config.md) promises.
+>
+> `prometheusd` grew 0.3 MB for the context gates, which is essentially nothing
+> because they hold no state beyond a two-entry cache.
+>
+> **The headroom is worth naming**, because this is the first phase where it
+> stops being generous.
+>
+> 142.8 MB against the 150 MB single-voice budget is within contract. Two things
+> narrow it further:
+>
+> - **Piper's RSS grows with use, and the harness cannot see it.** 100.1 MB
+>   freshly spawned; 107.8 MB after a day of real utterances, as the ONNX
+>   session allocates and keeps its working buffers. The harness samples a
+>   process that has just started, so **142.8 MB is the floor, not the steady
+>   state** — the same system measured **151.1 MB** live at the end of the day
+>   that produced these numbers.
+>
+>   That is **over the 150 MB single-voice budget**, by 1.1 MB, and it is
+>   recorded here rather than rounded away: the budget was set in Phase 0
+>   against a single voice and 117 MB, and ambient narration has spent most of
+>   the slack. It is not a problem today — 151 MB is 0.5 % of this machine's
+>   RAM — but the honest statement is "at budget", not "within it with room".
+> - **The second voice is currently off.** `voice.agent.enabled` adds another
+>   Piper, putting the total near **238 MB against the 250 MB two-voice
+>   budget** — inside, with noticeably less room than Phase 1's 228 MB.
+>
+> If a future phase adds another resident process, the warm-Piper flag is the
+> budget line to reconsider first: it trades ~100 MB for 0.3 s per utterance,
+> and it is the only line here big enough to matter.
 
 Over a 600-second idle window, every process in the Phase 1 measurement
 accumulated **0.000 s of CPU and a single context switch total** — not
@@ -135,6 +171,16 @@ touching the model constantly throughout the day.
 
 These are constraints on implementation, not aspirations:
 
+0. **Read the world only when about to act on it.** Phase 5 added context gates
+   (locked screen, fullscreen, other audio — [04](04-build-plan.md) task 5.4),
+   and the obvious implementation of all three is a timer. That would have been
+   the first polling loop in the system, and it would have run all day to
+   answer a question that only matters at the instant something wants to speak.
+   They are checked at intent time instead, with a 2-second cache so a burst of
+   intents shares one reading. Measured: 200 gate checks in **1.7 ms**, and
+   nothing at all runs while the desktop is idle. The rule generalises — if a
+   new signal seems to need a timer, check whether it only needs an answer at
+   the moment of use.
 1. **No polling anywhere.** Every watcher blocks on a socket read or an inotify
    watch. If any component has a `sleep` in a loop, it's wrong.
 2. **The toggle stops units; it does not set a flag.** `prometheus.target` with
@@ -172,8 +218,40 @@ in [04-build-plan.md](04-build-plan.md), not a nice-to-have.
 **Phase 0 result: within contract**, with room to spare — 117 MB against a
 150 MB budget, and no measurable CPU at all. **Phase 1 result: still within
 contract** after adding `prometheus-hypr` — 228 MB against the 250 MB
-two-voice budget, still no measurable idle CPU. Re-run the harness after any
-phase that adds a resident process:
+two-voice budget, still no measurable idle CPU. **Phase 5 result: within
+contract** with ambient narration live — 142.8 MB against the 150 MB
+single-voice budget, and over the full 600-second window **0.000 s of CPU and
+two context switches** across all three processes. Two switches in ten minutes
+is the number that actually proves the no-polling rule; the CPU figure alone
+could be faked by a sufficiently efficient poll loop.
+
+> **Phase 5 also fixed the harness, which had started lying.** It reported FAIL
+> three times while the system, measured directly over a quiet window, used
+> **0.000 s of CPU and took 0 context switches**. Three separate holes:
+>
+> - **Piper's first synthesis after a spawn initialises ONNX lazily, across
+>   several threads**, billing far more CPU-seconds than wall time: **1.62 s of
+>   CPU for the single word "Listening."** The fixed `sleep 3` after the
+>   power-on confirmation let part of that land after the baseline sample. It
+>   now waits until the broker reports itself continuously idle.
+> - **Desktop events during the "idle" window.** `prometheus-hypr` waking to
+>   receive them is the behaviour under test, not a breach of it.
+> - **A Claude Code turn ending fires the Stop hook, which speaks.** No desktop
+>   event, nothing in the journal, window looks idle — and a two-second
+>   utterance costs Piper ~1.4 s of CPU. Found in `prometheus transcript`, not
+>   by reasoning about it.
+>
+> The harness now counts **both** desktop events and utterances across the
+> window, and reports a non-idle window as **INCONCLUSIVE with both counts**
+> rather than FAIL.
+>
+> **The durable lesson, and the third time it has been rediscovered by hand**
+> (Phase 1's note about an animating window title says the same thing): the
+> contract is **"no CPU without an event", not "no CPU ever"**. The hard part
+> of testing it is not measuring CPU — it is enumerating what counts as an
+> event. A test that conflates the two is one a correct system cannot pass.
+
+Re-run the harness after any phase that adds a resident process:
 
 ```bash
 ./experiments/measure-overhead.sh          # 10-minute idle window

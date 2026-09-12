@@ -147,6 +147,23 @@ passing:
 | **Required anchor words** | A `claude_blocked` line that never says *Claude* |
 | **Polarity words** | "timed out" in a *success* bank; "still waiting" in a *failure* one |
 | Near-duplication | The same sentence with one word swapped |
+| **Contractions of banned words** *(Phase 5)* | `"He's stuck in Prometheus"` — `he` is banned, but `normalise` turns `he's` into `hes` |
+| **Plural proper nouns** *(Phase 5)* | `"Claudes awaits your response"` — invisible on the page, unmistakable aloud |
+| **Terminal punctuation** *(Phase 5)* | A line with no full stop runs into the next utterance |
+| **Dash spacing / hyphen-as-dash** *(Phase 5)* | `"…your input— Prometheus"`; ` - ` where the seeds write ` — ` |
+| **Self-narration** *(Phase 5)* | `"Lucent is aware Brave is opening."` — checked against the *configured* identity, so it survives a rename |
+| **Prediction** *(Phase 5)* | `"Long night ahead in Brave."` — it cannot see the future either |
+
+> **Every one of those needed an exemption before it was right.**
+> `waiting` and `prompt` stay legal for `claude_blocked`. `input` is legal but
+> `field` is not. `soon` is legal for `battery_low` alone. The self-narration
+> rule skips `claude_blocked_project`, because `{project}` often renders as
+> "Prometheus". And the prediction list had to be narrowed after it rejected
+> *"That doesn't happen often."* — which is `app_rare`'s entire job.
+>
+> The useful rule is never "ban the word". It is **"ban the word where it
+> cannot be true"**, and which moments those are is a fact about the events,
+> not about the vocabulary.
 
 Every rejection is logged with its reason, so whether the authoring model is
 earning its place is a matter of record rather than opinion.
@@ -195,8 +212,9 @@ Factors that raise interest:
 | **Novelty** — first time opening this app today | Genuinely notable |
 | **Unusual hour** — a terminal at 2 a.m. | Worth a remark |
 | **Rarity** — an app you open twice a month | More notable than your editor |
-| **Return after absence** — first activity in an hour | Natural re-entry point |
-| **Sequence oddity** — unusual app ordering | The "huh" moments |
+| **Return after absence** — first activity in ten minutes | Natural re-entry point |
+| **Long dwell ended** — five minutes in one window, then a switch | A real transition, not a hunt |
+| ~~**Sequence oddity**~~ | Never implemented; no weight exists for it |
 
 Factors that lower interest:
 
@@ -214,6 +232,46 @@ independent dials.
 
 The event journal from Phase 1 makes this tunable against real data — we can
 replay a week of actual events and see exactly what would have been spoken.
+
+> ### Phase 5 replayed this table, and most of it was not true
+>
+> *(2026-09-12 — see [notes/2026-09-12-phase-5.md](../notes/2026-09-12-phase-5.md).
+> The table above is the corrected version; the measurements that corrected it
+> are here.)*
+>
+> Over 247 real scorable events, the signals fired like this:
+>
+> | signal | fired | |
+> |---|---|---|
+> | `novel-today` | 5/247 (2.0 %) | effectively inert |
+> | `rare` | 9/247 (3.6 %) | effectively inert |
+> | `odd-hour` | 30/247 (12.1 %) | a blanket time-of-day multiplier |
+> | **`returned`** | **0/247 (0.0 %)** | **never fired at all** |
+> | `rapid-switch` | 44/247 (17.8 %) | a *penalty* — the only one doing work |
+>
+> `returned` used a 3600-second threshold; the longest real gap between desktop
+> events is 3454 seconds. The threshold sat just past the end of the data.
+>
+> Novelty and rarity failed structurally rather than by mistuning: they are
+> per-app signals on a **three-application desktop** (terminal 131, Claude Code
+> 68, Brave 48). After the first hour of any day nothing is novel or rare again.
+>
+> The result: of 23 utterances the scoring would have produced, **12 carried no
+> interest signal at all.** It was not selecting for interest — it was a 15 %
+> random sampler with a mild late-night bias.
+>
+> **What replaced them.** Dwell has genuine spread (p25 5 s, p50 17 s, p75 89 s,
+> p90 235 s) and is knowable with no lookahead, so `dwell_boost` / `dwell_secs`
+> were added and `return_secs` was cut to 600. `return_boost` also got its own
+> weight — it had been multiplying by `novelty_boost`, quietly coupling two
+> dials this document promises are independent.
+>
+> **And the normalization promise was not being kept.** `k = target / mean_raw`
+> applied once, with the quiet-period floor removing a large share of draws
+> *downstream* of it: a 15 % target achieved **9.6 %**, and every weight change
+> moved the volume too. It is now a closed loop with the gates inside it.
+> Getting that right took three attempts and two instructive failures — both
+> invisible from the metric being optimized — written up in the phase note.
 
 ---
 
@@ -305,10 +363,37 @@ seconds, with no code changes.
     "novelty_boost": 2.0,
     "rarity_boost": 1.5,
     "odd_hour_boost": 1.8,
+    "return_boost": 2.5,               // Phase 5: own weight, was reusing novelty
+    "return_secs": 600,                // Phase 5: 3600 never once fired
+    "dwell_boost": 2.0,                // Phase 5: the signal with real spread
+    "dwell_secs": 300,
     "recent_speech_penalty": 0.15,     // strong suppression
     "repetition_penalty": 0.4,
     "rapid_switch_penalty": 0.1,
-    "quiet_period_secs": 45            // hard floor between ambient utterances
+    "quiet_period_secs": 45,           // hard floor between ambient utterances
+
+    // Phase 5. Kinds that must carry a real signal, not merely win a draw.
+    // The loudest dial in the file: with "focus" listed, 1.2 utterances/hour
+    // and 100% of them justified; without it, 4.1/hour and 59%.
+    "require_reason": ["focus", "workspace", "fullscreen"],
+
+    // Phase 5. Which event kinds each verbosity tier may speak about; see
+    // the verbosity discussion below.
+    "verbosity_kinds": {
+      "quiet":  ["open"],
+      "normal": ["open", "focus"],
+      "chatty": ["open", "focus", "workspace", "fullscreen", "monitor"]
+    }
+  },
+
+  // Phase 5. Situations where speaking is wrong however interesting the thing
+  // is. Enforced in the broker, so they cover Claude and shell narration too.
+  "context_gates": {
+    "enabled": true,
+    "cache_secs": 2.0,
+    "screen_locked": { "enabled": true, "allow": [] },
+    "fullscreen":    { "enabled": true, "allow": ["critical"] },
+    "other_audio":   { "enabled": true, "allow": ["critical"] }
   },
 
   "limits": {

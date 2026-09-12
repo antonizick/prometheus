@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""prometheus-hypr — Hyprland event listener and journal (Phase 1).
+"""prometheus-hypr — Hyprland event listener, journal and ambient narrator.
 
 Reads Hyprland's push-based event feed (`.socket2.sock`), filters it down to
-what's worth remembering, and appends the result to
-~/.local/state/prometheus/journal as JSONL. No narration yet (docs/04, Phase
-1): this component only *collects*. `prometheus brief` reads the journal on
-request; a later phase adds live speaking.
+what's worth remembering, appends the result to
+~/.local/state/prometheus/journal as JSONL, and — since Phase 5 — decides which
+of those events is worth *saying*.
+
+Phase 1 deliberately built no narration: "collecting data first". Phase 5 spent
+that data. The scoring it now runs lives in `bin/prometheus-attention`, shared
+verbatim with `experiments/replay-scoring.py`, so what the replay harness
+predicts and what this process does are the same arithmetic rather than two
+implementations that agree until they don't.
 
 Filtering (docs/01-architecture.md):
   - windowtitle / windowtitlev2 are dropped unconditionally, unread. Titles
@@ -13,6 +18,12 @@ Filtering (docs/01-architecture.md):
     docs/00-feasibility.md.
   - Focus changes are debounced (~1.5s of quiet) so alt-tabbing through six
     windows produces one journal entry, not six.
+  - **Workspace switches are debounced the same way, as of Phase 5.** They were
+    not, and docs/01 had them as the always-spoken `quiet` floor. Replayed
+    against real history that meant 90 utterances in 7.5 hours with a median
+    gap of 1.4 seconds between them — one burst was nine switches in nine
+    seconds. Those are not nine destinations, they are one journey. Same rule
+    as focus now: stay quiet while moving, mention where you stopped.
   - Allowlist, not denylist: only app classes with a friendly name in
     config.json's hypr.app_names are journaled by open/close/focus. An
     unmapped class is logged once at debug level (to find and add later),
@@ -36,8 +47,11 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import importlib.machinery
+import importlib.util
 import json
 import os
+import random
 import selectors
 import signal
 import socket
@@ -45,6 +59,36 @@ import struct
 import subprocess
 import sys
 import time
+
+# realpath, not abspath: install.sh symlinks this into ~/.local/bin, and
+# abspath would resolve the sibling lookup below against that directory — where
+# prometheus-attention deliberately isn't, since it's a library with nothing to
+# run. Invoked through the symlink, narration would have silently degraded to
+# journal-only. Matches prometheus-claude's SCRIPT_DIR, which already does this.
+BIN_DIR = os.path.dirname(os.path.realpath(__file__))
+
+
+def _load_sibling(name: str, mod_name: str):
+    """Import an extension-less sibling executable as a module.
+
+    Same mechanism experiments/test-phrasebank.py uses. Kept tolerant: a
+    missing or broken sibling must degrade this process to journal-only, never
+    stop it collecting. Losing narration for a session is an inconvenience;
+    losing the journal loses the evidence that makes tuning possible at all.
+    """
+    path = os.path.join(BIN_DIR, name)
+    try:
+        loader = importlib.machinery.SourceFileLoader(mod_name, path)
+        spec = importlib.util.spec_from_loader(mod_name, loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+    except (OSError, ImportError, SyntaxError, ValueError):
+        return None
+
+
+ATTN = _load_sibling("prometheus-attention", "prometheus_attention")
+PB = _load_sibling("prometheus-phrasebank", "prometheus_phrasebank")
 
 HOME = os.path.expanduser("~")
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
@@ -56,6 +100,8 @@ STATE_DIR = os.environ.get("PROMETHEUS_STATE_DIR") or os.path.join(
 )
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 JOURNAL_PATH = os.path.join(STATE_DIR, "journal")
+SOCK_PATH = os.path.join(RUNTIME_DIR, "prometheus", "sock")
+GAIN_FILE = os.path.join(STATE_DIR, "attention-gain.json")
 
 HYPR_SIG = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
 HYPR_SOCK = (
@@ -70,6 +116,11 @@ DEFAULT_CONFIG = {
         # Alt-tabbing to find a window should produce silence, then one entry
         # for where you landed — not one entry per window passed through.
         "debounce_secs": 1.5,
+        # Same, for workspace switches. Phase 5 measured a 1.4s median gap
+        # between them, so without this the busiest event class is also the
+        # least debounced. Separate from debounce_secs because flicking
+        # through workspaces is faster than alt-tabbing through windows.
+        "workspace_settle_secs": 2.0,
         "journal": {"enabled": True, "max_bytes": 4194304},
         # class -> friendly name. This IS the allowlist (docs/01: "allowlist,
         # not denylist") — a class with no entry here is never journaled.
@@ -326,6 +377,199 @@ class Inotify:
 DEBOUNCE_EVENT = "activewindowv2"
 
 
+class Narrator:
+    """Decides whether a journalled event is worth saying, and in what words.
+
+    Three steps, in order, each of which can end in silence:
+
+      1. Is this kind of event narratable at the current verbosity?
+      2. Is it interesting enough, given everything already said? (the shared
+         scorer, plus the gain controller that holds the overall rate near
+         `target_rate` — see bin/prometheus-attention)
+      3. Is there a phrasing for the *moment* it represents?
+
+    Step 3 is the part that makes docs/08's "second axis" real. The scorer
+    doesn't just hand back a probability, it hands back *why* the event was
+    interesting, and that reason selects which moment fires: a first sighting
+    today draws from `app_first_today`, a return after an absence from
+    `app_returned`, a rarely-touched app from `app_rare`. Twelve phrasings
+    across five distinguishable moments is far less predictable than forty of
+    one, and — more to the point — each one is true of the specific event.
+
+    Never blocks. The socket write is fire-and-forget with a short timeout
+    (docs/07 rule 5: "no producer blocks"), and every failure path here is a
+    silence, never an exception into the event loop.
+    """
+
+    # Which phrasebank moment a scored event becomes. Order matters — the
+    # first matching reason wins, most-specific first, so an app you have not
+    # touched in weeks that you also open at 2am is reported as rare rather
+    # than as late, because rarity is the more interesting of the two.
+    REASON_MOMENTS = (
+        ("rare", "app_rare"),
+        ("novel-today", "app_first_today"),
+        ("returned", "app_returned"),
+        ("long-dwell", "app_returned"),
+        ("odd-hour", "app_odd_hour"),
+    )
+
+    def __init__(self, cfg: dict) -> None:
+        self.cfg = cfg
+        self.bank = None
+        self.scorer = None
+        self.gate = None
+        self.control = None
+        self._rnd = random.Random()
+        self.stats = {"scored": 0, "spoke": 0, "quiet": 0, "no_phrasing": 0,
+                      "gated_verbosity": 0, "gated_no_reason": 0,
+                      "seeded_from_journal": 0}
+        self.configure(cfg)
+
+    def configure(self, cfg: dict) -> None:
+        """(Re)read config. Called on every hot-reload.
+
+        The scorer's accumulated history deliberately survives a reload —
+        editing a weight should change what happens next, not amnesia about
+        which apps you have already used today.
+        """
+        self.cfg = cfg
+        self.enabled = bool(ATTN) and bool(
+            (cfg.get("speak", {}).get("desktop_activity", {}) or {}).get("enabled", True))
+        if not ATTN:
+            return
+        self.attn = ATTN.attention_from_config(cfg)
+        self.target_rate = ATTN.target_rate_from_config(cfg)
+        self.require_reason = ATTN.require_reason_kinds(cfg)
+        if self.scorer is None:
+            self.scorer = ATTN.Scorer(self.attn)
+            seeded = self.scorer.seed_from_journal(JOURNAL_PATH)
+            self.stats["seeded_from_journal"] = seeded
+            LOG.info("narrate.seeded",
+                     "absorbed today's journal so a restart isn't amnesia",
+                     events=seeded or None)
+            self.gate = ATTN.Gate(self.attn)
+            self.control = ATTN.RateController(self.attn, self.target_rate, GAIN_FILE)
+        else:
+            self.scorer.attn = self.attn
+            self.gate.attn = self.attn
+            self.control.attn = self.attn
+            self.control.target = self.target_rate
+        if self.bank is None and PB is not None:
+            try:
+                self.bank = PB.Bank.open(cfg)
+            except (OSError, ValueError, KeyError, AttributeError) as e:
+                LOG.warn("narrate.no_bank", str(e))
+
+    def verbosity(self) -> str:
+        """Read live, not cached: SUPER+ALT+V writes this file mid-session."""
+        try:
+            with open(os.path.join(STATE_DIR, "verbosity")) as f:
+                v = f.read().strip()
+            return v if v in ATTN.VERBOSITY_KINDS else "normal"
+        except OSError:
+            return self.cfg.get("verbosity", "normal")
+
+    def moment_for(self, kind: str, reasons: list[str]) -> str | None:
+        if kind == "workspace":
+            return "workspace_switched"
+        if kind == "open":
+            return "app_opened"
+        if kind in ("focus", "fullscreen", "close"):
+            for reason, moment in self.REASON_MOMENTS:
+                if any(r.startswith(reason) for r in reasons):
+                    return moment
+            # A focus change with nothing notable about it is the case
+            # docs/06 principle 6 is about — he knows he just switched
+            # windows. `app_returned` is the mildest thing in the bank that
+            # is still true of it.
+            return "app_returned"
+        return None
+
+    def slots_for(self, moment: str, app: str, event: dict) -> dict:
+        if moment == "workspace_switched":
+            return {"workspace": event.get("name") or event.get("id") or "another"}
+        return {"app": app}
+
+    def consider(self, kind: str, app: str, event: dict, coalesced: int = 0) -> None:
+        """Score one event and speak it, or don't. Called once per journal write."""
+        if not self.enabled or self.scorer is None:
+            return
+        now = time.time()
+
+        # Feed the scorer everything, narrate only what this tier allows.
+        # Verbosity is about what it talks about, not what it knows: a focus
+        # change still counts as activity for "returned after an absence" even
+        # at `quiet`, where focus changes are never spoken.
+        scored = self.scorer.score(now, kind, app, coalesced)
+        if kind not in ATTN.kinds_for_verbosity(self.verbosity(), self.cfg):
+            self.stats["gated_verbosity"] += 1
+            return
+
+        # Some kinds never speak on a bare draw — see DEFAULT_REQUIRE_REASON.
+        if kind in self.require_reason and not ATTN.meaningful_reasons(scored["reasons"]):
+            self.stats["gated_no_reason"] += 1
+            LOG.debug("narrate.no_reason", app, kind=kind)
+            return
+
+        self.stats["scored"] += 1
+        prob, gate = self.gate.apply(now, app, self.control.probability(scored["raw"]))
+        spoke = self._rnd.random() < prob
+
+        LOG.debug("narrate.scored", app, kind=kind, raw=round(scored["raw"], 3),
+                  prob=round(prob, 4), gate=gate, k=round(self.control.k, 3),
+                  reasons=",".join(scored["reasons"]) or None,
+                  decision="speak" if spoke else "quiet")
+
+        # The controller learns from every eligible event, spoken or not —
+        # that ratio *is* the achieved rate it steers on.
+        self.control.observe(spoke)
+
+        if not spoke:
+            self.stats["quiet"] += 1
+            return
+
+        moment = self.moment_for(kind, scored["reasons"])
+        text = None
+        if moment and self.bank is not None:
+            try:
+                text = self.bank.pick(moment, self.slots_for(moment, app, event))
+            except (OSError, ValueError, KeyError, AttributeError) as e:
+                LOG.warn("narrate.pick_failed", str(e), moment=moment)
+        if not text:
+            # No phrasing is a silence, not a fallback. A hand-rolled default
+            # here would be the one sentence in the system that never varies,
+            # which is precisely what ADR-0004 exists to prevent.
+            self.stats["no_phrasing"] += 1
+            LOG.debug("narrate.no_phrasing", moment or kind)
+            return
+
+        self.gate.record_spoken(now, app)
+        self.stats["spoke"] += 1
+        LOG.info("narrate.speak", text, moment=moment, app=app,
+                 reasons=",".join(scored["reasons"]) or None)
+        self.send(text, moment)
+
+    def send(self, text: str, moment: str) -> None:
+        intent = {
+            "text": text,
+            "priority": "ambient",
+            "category": "hypr",
+            # Ambient remarks are about *now*. One that waited behind a long
+            # utterance is describing a window you already left, so it expires
+            # rather than arriving late and wrong.
+            "ttl_ms": 8000,
+            "dedup_key": f"hypr:{moment}",
+        }
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            s.connect(SOCK_PATH)
+            s.sendall(json.dumps(intent).encode() + b"\n")
+            s.close()
+        except OSError as e:
+            LOG.debug("narrate.unreachable", str(e))
+
+
 class Listener:
     def __init__(self) -> None:
         self.cfg = load_config()
@@ -337,11 +581,15 @@ class Listener:
         self.windows: dict[str, str] = {}      # address -> class
         self.current_addr: str | None = None
         self.pending_focus: dict | None = None  # {"address", "count", "deadline"}
+        self.pending_workspace: dict | None = None  # {"id","name","count","deadline"}
         self._unknown_seen: set[str] = set()
         self._last_workspace: tuple | None = None
         self._last_monitor: tuple | None = None
 
-        self.stats = {"dropped_title": 0, "focus_settled": 0, "unknown_classes": 0}
+        self.narrator = Narrator(self.cfg)
+
+        self.stats = {"dropped_title": 0, "focus_settled": 0, "unknown_classes": 0,
+                      "workspace_settled": 0, "workspace_coalesced": 0}
 
         self._sock: socket.socket | None = None
         self._buf = bytearray()
@@ -349,6 +597,8 @@ class Listener:
     def _apply_hypr_cfg(self) -> None:
         h = self.cfg.get("hypr", {})
         self.debounce_secs = float(h.get("debounce_secs", 1.5))
+        self.workspace_settle_secs = float(
+            h.get("workspace_settle_secs", max(2.0, self.debounce_secs)))
         self.app_names: dict[str, str] = dict(h.get("app_names", {}))
 
     # -- seeding --------------------------------------------------------
@@ -454,9 +704,10 @@ class Listener:
             if cls:
                 self._note_unknown(cls)
             return
-        self.journal.write("focus", cls=cls, name=name,
-                            coalesced=pf["count"] if pf["count"] > 1 else None)
+        coalesced = pf["count"] if pf["count"] > 1 else None
+        self.journal.write("focus", cls=cls, name=name, coalesced=coalesced)
         LOG.debug("hypr.focus", name, cls=cls, coalesced=pf["count"])
+        self.narrator.consider("focus", name, {"cls": cls}, pf["count"])
 
     def _on_openwindow(self, data: str) -> None:
         parts = data.split(",", 3)
@@ -470,6 +721,7 @@ class Listener:
             return
         self.journal.write("open", cls=cls, name=name)
         LOG.debug("hypr.open", name, cls=cls)
+        self.narrator.consider("open", name, {"cls": cls})
 
     def _on_closewindow(self, addr: str) -> None:
         cls = self.windows.pop(addr, None)
@@ -482,30 +734,73 @@ class Listener:
             return
         self.journal.write("close", cls=cls, name=name)
         LOG.debug("hypr.close", name, cls=cls)
+        # Deliberately journalled but never narrated: docs/06 lists "app
+        # closed" as one of the events that says nothing, because closing a
+        # window is intentional and you were there when it happened.
 
     def _on_workspace(self, data: str) -> None:
         wid, _, wname = data.partition(",")
-        key = (wid, wname)
-        if key == self._last_workspace:
-            return
-        self._last_workspace = key
-        self.journal.write("workspace", id=wid or None, name=wname or None)
-        LOG.debug("hypr.workspace", wname or wid)
+        self._queue_workspace(wid or None, wname or None)
 
     def _on_workspace_legacy(self, data: str) -> None:
-        wname = data.strip()
-        key = (None, wname)
+        self._queue_workspace(None, data.strip() or None)
+
+    def _queue_workspace(self, wid: str | None, wname: str | None) -> None:
+        """Hold a workspace switch open until the flicking stops.
+
+        Mirrors the focus debounce, and for the same reason measured on real
+        data: 54% of workspace switches in the Phase 5 journal arrived within
+        two seconds of the one before. Journalling each one made the busiest
+        event class also the least filtered.
+
+        As with focus, a repeat of the destination already pending must not
+        push the deadline out — holding SUPER and walking across five
+        workspaces should settle once, on the fifth.
+        """
+        key = (wid, wname)
+        if self.pending_workspace is not None:
+            if self.pending_workspace["key"] != key:
+                self.stats["workspace_coalesced"] += 1
+            self.pending_workspace["key"] = key
+            self.pending_workspace["count"] += 1
+            return
         if key == self._last_workspace:
             return
+        self.pending_workspace = {
+            "key": key,
+            "count": 1,
+            "deadline": time.monotonic() + self.workspace_settle_secs,
+        }
+
+    def settle_workspace(self) -> None:
+        pw = self.pending_workspace
+        self.pending_workspace = None
+        if pw is None:
+            return
+        key = pw["key"]
+        if key == self._last_workspace:
+            # Flicked out and back again — you ended where you started, so
+            # nothing happened worth recording.
+            return
         self._last_workspace = key
-        self.journal.write("workspace", name=wname or None)
-        LOG.debug("hypr.workspace", wname)
+        wid, wname = key
+        count = pw["count"]
+        self.stats["workspace_settled"] += 1
+        self.journal.write("workspace", id=wid, name=wname,
+                           coalesced=count if count > 1 else None)
+        LOG.debug("hypr.workspace", wname or wid, coalesced=count)
+        self.narrator.consider("workspace", f"workspace {wname or wid}",
+                               {"id": wid, "name": wname}, count)
 
     def _on_fullscreen(self, state: str) -> None:
         cls = self.windows.get(self.current_addr) if self.current_addr else None
         name = self.app_names.get(cls) if cls else None
         self.journal.write("fullscreen", state=state, cls=cls, name=name)
         LOG.debug("hypr.fullscreen", name or cls or "", state=state)
+        # Entering fullscreen is a request to be left alone — docs/06 has it
+        # saying nothing, and docs/04 task 5.4 makes it a gate on everything
+        # else too (enforced in prometheusd, which sees all speech, not just
+        # this producer's).
 
     def _on_monitor(self, data: str) -> None:
         mon, _, ws = data.partition(",")
@@ -531,7 +826,30 @@ class Listener:
         LOG.configure(self.cfg)
         self.journal.configure(self.cfg)
         self._apply_hypr_cfg()
-        LOG.info("hypr.config_reloaded", path=CONFIG_FILE, app_names=len(self.app_names))
+        self.narrator.configure(self.cfg)
+        LOG.info("hypr.config_reloaded", path=CONFIG_FILE, app_names=len(self.app_names),
+                 narrating=self.narrator.enabled)
+
+    # -- settle deadlines -------------------------------------------------
+
+    def _next_deadline(self) -> float | None:
+        """Earliest pending settle deadline, or None if nothing is pending.
+
+        Two independent debounces now share one event loop, so the select()
+        timeout is the nearer of the two rather than focus's alone. Getting
+        this wrong is silent: a workspace switch would sit in `pending` until
+        some unrelated event happened to wake the loop.
+        """
+        deadlines = [p["deadline"] for p in (self.pending_focus, self.pending_workspace)
+                     if p is not None]
+        return min(deadlines) if deadlines else None
+
+    def _settle_due(self) -> None:
+        now = time.monotonic()
+        if self.pending_focus is not None and now >= self.pending_focus["deadline"]:
+            self.settle_focus()
+        if self.pending_workspace is not None and now >= self.pending_workspace["deadline"]:
+            self.settle_workspace()
 
     # -- main loop --------------------------------------------------------
 
@@ -563,9 +881,15 @@ class Listener:
         signal.set_wakeup_fd(wake_w)
         sel.register(wake_r, selectors.EVENT_READ, "wake")
 
-        LOG.info("hypr.ready", "journaling filtered Hyprland events",
+        LOG.info("hypr.ready",
+                 "journaling and narrating" if self.narrator.enabled
+                 else "journaling filtered Hyprland events",
                  journal=self.journal.path, debounce_secs=self.debounce_secs,
-                 tracked_classes=len(self.app_names), pid=os.getpid())
+                 workspace_settle_secs=self.workspace_settle_secs,
+                 tracked_classes=len(self.app_names), narrating=self.narrator.enabled,
+                 target_rate=self.narrator.target_rate if self.narrator.enabled else None,
+                 gain=round(self.narrator.control.k, 3) if self.narrator.enabled else None,
+                 pid=os.getpid())
 
         shutdown = {"flag": False}
 
@@ -574,12 +898,13 @@ class Listener:
 
         signal.signal(signal.SIGTERM, on_term)
         signal.signal(signal.SIGINT, on_term)
-        signal.signal(signal.SIGUSR1, lambda *_: LOG.info("hypr.stats", **self.stats))
+        signal.signal(signal.SIGUSR1,
+                      lambda *_: LOG.info("hypr.stats", **self.stats,
+                                          **self.narrator.stats))
 
         while not shutdown["flag"]:
-            timeout = None
-            if self.pending_focus is not None:
-                timeout = max(0.0, self.pending_focus["deadline"] - time.monotonic())
+            deadline = self._next_deadline()
+            timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
             try:
                 events = sel.select(timeout=timeout)
             except OSError as e:
@@ -587,8 +912,8 @@ class Listener:
                     continue
                 break
 
-            if not events and self.pending_focus is not None:
-                self.settle_focus()
+            if not events and deadline is not None:
+                self._settle_due()
                 continue
 
             for key, _mask in events:
@@ -620,10 +945,9 @@ class Listener:
                         pass
 
             # A settle deadline may have passed while handling I/O above.
-            if self.pending_focus is not None and time.monotonic() >= self.pending_focus["deadline"]:
-                self.settle_focus()
+            self._settle_due()
 
-        LOG.info("hypr.stopping", **self.stats)
+        LOG.info("hypr.stopping", **self.stats, **self.narrator.stats)
         signal.set_wakeup_fd(-1)
         os.close(wake_r)
         os.close(wake_w)

@@ -6,12 +6,26 @@ a Linux desktop that decides *what is worth saying* — and says almost nothing.
 No cloud, no API keys, no ongoing cost. Everything runs on the machine it talks
 about.
 
-> **Status:** Phases 0–4 built and measured. The speech broker, event journal,
-> briefings, local-LLM summarizer, offline phrase bank, Claude Code hooks, and
-> shell integration (exit-code narration + the opt-in `pr` wrapper) are all
-> wired in. General unprompted *desktop* narration is deliberately **not**
-> wired up yet (Phase 5) — Claude Code's own blocked/finished narration and
-> shell results are the two push paths live so far. See [Status](#status).
+> **Status:** Phases 0–5 built and measured. The speech broker, event journal,
+> briefings, local-LLM summarizer, offline phrase bank, Claude Code hooks,
+> shell integration, and — since Phase 5 — **ambient desktop narration**, tuned
+> against real journalled history rather than guessed. Context gates (locked
+> screen, fullscreen, other audio) and the migrated `omarchy-tts-*` scripts all
+> route through the one broker. See [Status](#status).
+>
+> Phase 5 replayed the narration policy against a real working day before
+> switching it on. As designed it would have spoken **14.7 times an hour** with
+> fewer than half of those utterances having any reason behind them; it now
+> speaks **1.2 times an hour, and every one carries a signal**. Three of the
+> five interest signals turned out never to fire against real data. The whole
+> argument is in [notes/2026-09-12-phase-5.md](notes/2026-09-12-phase-5.md) and
+> is re-runnable with `experiments/replay-scoring.py --compare`.
+>
+> *(Utterances-per-hour divides by wall-clock time, so a journal containing a
+> lot of idle reads quieter — the same configuration measures 0.8/hour over a
+> 12-hour window. The stable figures are the ones that describe the policy
+> rather than the day: **~16 % achieved against a 15 % target**, and **100 % of
+> utterances carrying a reason**, up from 46 %.)*
 
 ---
 
@@ -152,16 +166,21 @@ talking mid-word.
 | 2 | Local LLM: summarizer, LLM briefings, phrase bank | ✅ built, bank approved by ear |
 | 3 | Claude Code integration — `Stop`/`Notification` hooks | ✅ built |
 | 4 | Shell integration | ✅ built, not yet heard live |
-| 5 | Living with it — tuning from real data | planned |
+| 5 | Living with it — tuning from real data | **built** |
 | 6 | Two-way conversation | speculative |
 
-**There is deliberately no unprompted *desktop* narration yet.** Phase 1
-collects evidence without speaking, so that when narration is switched on, the
-policy can be tuned against a real week of events rather than a guess.
-`experiments/replay-scoring.py` replays that history and reports what *would*
-have been said. Claude Code's own push events (blocked / finished) are the one
-exception, live since Phase 3 — narrow enough in scope (docs/01: "push only
-what can't wait") that it didn't need that same evidence-first treatment.
+**Desktop narration was switched on last, and only after the evidence existed
+to aim it.** Phase 1 collected a journal without speaking; Phase 5 spent it.
+That ordering paid for itself: replayed against a real day, three of the five
+interest signals in the design had *never fired* — `returned` used a
+3600-second absence threshold and the longest real gap was 3454 seconds — and
+workspace switches, which the architecture made the always-on floor, turned out
+to be the most frequent event on the desktop rather than the rarest, absorbing
+~90% of all ambient speech.
+
+None of that is visible from the design. All of it is obvious from one day of
+`experiments/replay-scoring.py --compare`, which still re-runs the entire
+argument against whatever journal exists now.
 
 ## Requirements
 
@@ -238,6 +257,18 @@ prometheus-phrasebank add app_opened "Right, {app}." # write one of your own
 prometheus-phrasebank veto app_returned "…"          # cut one, permanently
 prometheus feedback "that broke my concentration"    # capture a reaction now
 experiments/replay-scoring.py --rate 0.05            # what a change *would* have done
+experiments/replay-scoring.py --compare              # this policy vs the one before it
+```
+
+**The two dials worth knowing first**, both one line in `config.json`:
+
+```jsonc
+"attention": { "require_reason": ["focus", "workspace", "fullscreen"] }
+// drop "focus" to hear ~3x as much: 1.2 -> 4.1 utterances/hour, measured
+
+"speak": { "claude_finished": { "min_turn_secs": 45 } }
+// 45s speaks after ~53% of turns; 0 speaks after all of them
+// `prometheus log | grep turn_secs` shows your own distribution first
 ```
 
 Speech preferences only surface after living with something, so the tuning path

@@ -276,9 +276,40 @@ capture in [00-feasibility](00-feasibility.md):
 - **Say the friendly name.** `brave-browser` → "Brave".
 
 Verbosity tiers control breadth:
-- `quiet` — workspace switches only
-- `normal` — + app launches and closes
-- `chatty` — + focus changes, fullscreen, monitor changes
+- ~~`quiet` — workspace switches only~~
+- ~~`normal` — + app launches and closes~~
+- ~~`chatty` — + focus changes, fullscreen, monitor changes~~
+
+> **Re-cut in Phase 5, against measurement** (2026-09-12 — see
+> [notes/2026-09-12-phase-5.md](../notes/2026-09-12-phase-5.md)). This ladder
+> assumed workspace switches are the rarest and most deliberate desktop event,
+> which is why they were the always-on floor. The journal says the opposite:
+> **90 in 7.8 hours** against 6 app launches, with a **median gap of 1.4
+> seconds** between them, and their content is already on screen in the bar
+> you are looking at.
+>
+> Left there it broke the tier mechanically, not just aesthetically — the rate
+> controller speaks a fixed fraction of *eligible* events, so when 53 of 59
+> eligible events at `normal` are workspace switches, ~90 % of everything the
+> system says is a workspace number. Measured: 17 of 20 utterances were
+> "Two, then." / "Three now." / "One."
+>
+> Re-cut on what an utterance is *worth*, which is what this ladder was
+> reaching for:
+>
+> | tier | kinds | measured |
+> |---|---|---|
+> | `quiet` | app launches only | 0.1 utterances/hour |
+> | `normal` | + focus changes | 1.2 utterances/hour |
+> | `chatty` | + workspace, fullscreen, monitor | 4.7 utterances/hour |
+>
+> `close` is in no tier — [06](06-voice-and-tone.md) already has closing a
+> window saying nothing, because you were there when it happened. It stays
+> journalled, never spoken. Workspace switches are additionally debounced
+> (`hypr.workspace_settle_secs`) exactly as focus changes always were.
+>
+> The composition lives in `config.json` → `attention.verbosity_kinds`, so
+> moving a kind between tiers is an edit rather than a rebuild.
 
 ---
 

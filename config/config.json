@@ -83,13 +83,19 @@
     "inter_sentence_ms": 200
   },
 
-  // Phase 1: the Hyprland event listener (prometheus-hypr) and `prometheus
-  // brief`. No narration yet — this is the pull path, collecting data first.
+  // The Hyprland event listener (prometheus-hypr): the journal, and since
+  // Phase 5 the ambient narration decided from it.
   "hypr": {
     // Quiet time after a focus change before it's journaled. Alt-tabbing to
     // find a window should produce silence, then one entry for where you
     // landed, not one per window passed through.
     "debounce_secs": 1.5,
+
+    // Same idea for workspace switches, added in Phase 5. Measured median gap
+    // between them: 1.4 seconds — 54% arrive within two seconds of the one
+    // before, and one real burst was nine switches in nine seconds. Those are
+    // not nine destinations, they are one journey.
+    "workspace_settle_secs": 2.0,
 
     "journal": { "enabled": true, "max_bytes": 4194304 },
 
@@ -121,21 +127,82 @@
 
   "speak": {
     "claude_blocked":    { "enabled": true,  "priority": "critical" },
-    "claude_finished":   { "enabled": true,  "priority": "normal",  "min_turn_secs": 0,
+    // min_turn_secs was parked at 0 through Phase 3 ("the right number is
+    // found by ear, not by guessing" — docs/04 task 5.1a). Phase 5 went looking
+    // for the evidence and found none had been recorded, so the hook now
+    // measures and logs `turn_secs` on every Stop whatever this is set to.
+    //
+    // The starting number is measured: 154 turns across 59 real transcripts.
+    //   p25 15s | p50 52s | p75 164s | p90 455s
+    //   at 30s it speaks after 63% of turns
+    //   at 45s                  53%    <- here
+    //   at 60s                  46%
+    // Raise it toward 60-90 if it speaks when you had not looked away; set 0
+    // to hear every turn.   prometheus log | grep turn_secs
+    "claude_finished":   { "enabled": true,  "priority": "normal",  "min_turn_secs": 45,
                           "short_circuit_words": 25 },
     "command_failed":    { "enabled": true,  "priority": "normal",  "min_duration_secs": 10 },
     "command_succeeded": { "enabled": false, "min_duration_secs": 30 },
     "desktop_activity":  { "enabled": true,  "priority": "ambient", "target_rate": 0.15 }
   },
 
+  // Situations where speaking is wrong regardless of how interesting the
+  // thing is (Phase 5, task 5.4). Enforced in the broker, so they cover Claude
+  // and shell narration too, not just ambient desktop remarks. `allow` lists
+  // the priorities that still speak through a closed gate. An intent marked
+  // user_initiated — the read-aloud keys — skips all of them.
+  "context_gates": {
+    "enabled": true,
+    "cache_secs": 2.0,
+    "screen_locked": { "enabled": true, "allow": [] },
+    "fullscreen":    { "enabled": true, "allow": ["critical"] },
+    "other_audio":   { "enabled": true, "allow": ["critical"] }
+  },
+
   "attention": {
     "novelty_boost": 2.0,
     "rarity_boost": 1.5,
     "odd_hour_boost": 1.8,
+
+    // Phase 5, tuned against real journal. The old absence threshold was 3600s
+    // and never once fired — the longest real gap between desktop events was
+    // 3454s. return_boost also has its own weight now; it used to silently
+    // reuse novelty_boost, coupling two dials docs/08 promises are independent.
+    "return_boost": 2.5,
+    "return_secs": 600,
+
+    // New in Phase 5. Novelty and rarity are per-app signals, and this is a
+    // three-app desktop — after the first hour nothing is novel or rare ever
+    // again (measured: they fired on 2.0% and 3.6% of events). Dwell has real
+    // spread: p50 17s, p75 89s, p90 235s.
+    "dwell_boost": 2.0,
+    "dwell_secs": 300,
+
     "recent_speech_penalty": 0.15,
     "repetition_penalty": 0.4,
     "rapid_switch_penalty": 0.1,
-    "quiet_period_secs": 45
+    "quiet_period_secs": 45,
+
+    // Kinds that must carry a real interest signal, not merely win a
+    // probability draw. THE LOUDEST DIAL IN THIS FILE. Measured at `normal`:
+    //   with "focus" listed      1.2 utterances/hour, 100% carrying a reason
+    //   without it               4.1 utterances/hour,  59% carrying a reason
+    // Remove "focus" to hear roughly three times as much.
+    "require_reason": ["focus", "workspace", "fullscreen"],
+
+    // Which event kinds each verbosity tier may speak about. Re-cut in Phase 5
+    // on what an utterance is worth rather than how often its kind fires:
+    // docs/01 had workspace switches as the always-on `quiet` floor, assuming
+    // they are rare and deliberate. The journal says they are the most frequent
+    // thing that happens (90 in 7.8h against 6 app launches) and their content
+    // is already on screen. Left there they absorbed ~90% of all ambient
+    // speech. `close` is in no tier: docs/06 has closing a window saying
+    // nothing, because you were there when it happened.
+    "verbosity_kinds": {
+      "quiet":  ["open"],
+      "normal": ["open", "focus"],
+      "chatty": ["open", "focus", "workspace", "fullscreen", "monitor"]
+    }
   },
 
   "limits": {
@@ -145,7 +212,14 @@
     "dedup_window_secs": 30,
     // Per-category overrides for max_utterances_per_minute.
     // "critical" is always exempt: a blocked agent must be able to speak.
-    "per_category": { "manual": 60 }
+    //
+    // read-cursor and terminal-live are the migrated omarchy-tts-* scripts
+    // (Phase 5, task 5.5). They are user-initiated — a key was pressed — and
+    // terminal-live submits one intent per burst of terminal output, so the
+    // 4/minute ambient cap would silently eat most of what it was switched on
+    // to read. It is self-limiting instead: it blocks on each utterance being
+    // spoken before submitting the next.
+    "per_category": { "manual": 60, "read-cursor": 60, "terminal-live": 240 }
   },
 
   "llm": {

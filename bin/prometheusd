@@ -61,6 +61,26 @@ PRIORITIES = ("critical", "normal", "ambient", "debug")
 PRIORITY_RANK = {p: i for i, p in enumerate(PRIORITIES)}
 VERBOSITIES = ("quiet", "normal", "chatty")
 
+# The lowest priority each verbosity will speak (docs/04 task 5.2). Before
+# Phase 5 this gated only `debug`, so `quiet` and `normal` behaved identically
+# and the SUPER+ALT+V key did nothing for two of its three positions.
+#
+# Verbosity is deliberately the *blunt* dial, on a key, for a bad afternoon —
+# docs/10: "This is the dial for a bad afternoon, not for a preference." So
+# `quiet` drops ambient desktop remarks entirely rather than narrowing them;
+# the graded version of that is `attention.verbosity_kinds`, which decides
+# which kinds of desktop event are eligible in the first place.
+#
+# Nothing here can silence `critical`. A blocked agent is the one thing the
+# whole system exists for, and docs/06 calls "Claude needs you" plausibly the
+# most valuable thing it will ever say. Turning it off is what the power
+# switch is for.
+VERBOSITY_FLOOR = {
+    "quiet": "normal",      # critical + normal; no ambient, no debug
+    "normal": "ambient",    # + ambient desktop remarks; no debug
+    "chatty": "debug",      # everything
+}
+
 # --------------------------------------------------------------------------
 # Logging
 # --------------------------------------------------------------------------
@@ -286,6 +306,32 @@ DEFAULT_CONFIG = {
         "enabled": True,
         # Speak only while voxtype reports one of these states.
         "speak_states": ["idle"],
+    },
+    # Situations where speaking is wrong regardless of how interesting the
+    # thing is (docs/04 task 5.4). Checked here rather than in each producer
+    # because the broker is the one place every utterance passes through —
+    # ADR-0001 — so a gate added here covers shell and Claude narration too,
+    # not just the ambient path that prompted it.
+    #
+    # `allow` lists the priorities that still speak through a closed gate.
+    # Empty means nothing does.
+    "context_gates": {
+        "enabled": True,
+        # These read the world with subprocesses, so a burst of intents shares
+        # one answer rather than spawning three processes each.
+        "cache_secs": 2.0,
+        # Locked screen means nobody is in the room. Even a blocked agent is
+        # worth nothing said to an empty chair, and the alert is not lost —
+        # `prometheus transcript` shows it as dropped, with the reason.
+        "screen_locked": {"enabled": True, "allow": []},
+        # Fullscreen is a request to be left alone: a video, a game, a
+        # presentation. A blocked agent is still worth interrupting for; an
+        # observation that Brave came to the foreground is not.
+        "fullscreen": {"enabled": True, "allow": ["critical"]},
+        # Something else is using the speakers. Talking over music is
+        # tolerable; talking over a call is not, and we cannot tell them
+        # apart, so the cautious reading wins for everything but critical.
+        "other_audio": {"enabled": True, "allow": ["critical"]},
     },
     "limits": {
         "max_words_unprompted": 15,
@@ -789,6 +835,156 @@ class Intent:
         return d is not None and now > d
 
 
+class ContextGates:
+    """Situations where speaking is wrong however interesting the thing is.
+
+    Distinct from the mic gate in both mechanism and meaning. The mic gate is
+    *pushed* — voxtype publishes a state file, inotify wakes us, and speech
+    stops mid-word because talking over dictation corrupts a transcript. These
+    are *pulled*, at the moment an intent arrives, and they are about whether
+    anyone is in a position to hear.
+
+    Pulled, specifically, to keep docs/07 rule 1 ("no polling anywhere"). There
+    is no timer here and nothing runs while the desktop is idle. The cost is
+    paid per utterance, which is the right place for it: at the measured
+    ambient rate the answer is refreshed a few times an hour, and the cache
+    collapses a burst of intents onto one reading.
+
+    Every check fails *open*. A missing `loginctl`, a Hyprland that will not
+    answer, a pactl that errors — none of those are evidence the screen is
+    locked, and a gate that silences the system because a subprocess failed
+    would be a far worse bug than the one it was added to prevent.
+    """
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self._cache: dict[str, tuple[float, bool]] = {}
+
+    def configure(self, cfg: dict) -> None:
+        self.cfg = cfg
+        self._cache.clear()
+
+    def _settings(self) -> dict:
+        return self.cfg.get("context_gates", {}) or {}
+
+    def _cached(self, name: str, probe) -> bool:
+        ttl = float(self._settings().get("cache_secs", 2.0))
+        now = time.monotonic()
+        hit = self._cache.get(name)
+        if hit is not None and now - hit[0] < ttl:
+            return hit[1]
+        try:
+            value = bool(probe())
+        except Exception as e:                      # noqa: BLE001 — fail open
+            LOG.debug("gate.context_probe_failed", str(e), gate=name)
+            value = False
+        self._cache[name] = (now, value)
+        return value
+
+    @staticmethod
+    def _run(args: list[str], timeout: float = 1.0) -> str:
+        return subprocess.run(args, capture_output=True, text=True,
+                              timeout=timeout).stdout
+
+    # -- the probes ------------------------------------------------------
+
+    def _session_id(self) -> str | None:
+        """The graphical session to ask about the lock.
+
+        Not `self`: this daemon runs as a systemd *user* unit, which does not
+        belong to a login session, and `loginctl show-session self` fails with
+        "Caller does not belong to any known session". That failure is silent
+        in the sense that matters — the gate would fail open and never once
+        report a locked screen, which reads exactly like "the screen was never
+        locked". Found by probing it on this machine rather than by reasoning
+        about it.
+
+        `show-user -p Display` names the user's graphical session from
+        outside it, which is the question actually being asked.
+        """
+        sid = os.environ.get("XDG_SESSION_ID")
+        if sid:
+            return sid
+        out = self._run(["loginctl", "show-user", str(os.getuid()),
+                         "-p", "Display", "--value"]).strip()
+        return out or None
+
+    def _screen_locked(self) -> bool:
+        # logind is authoritative and cheap, and unlike looking for a lock
+        # process by name it does not need to know which locker is installed.
+        sid = self._session_id()
+        if not sid:
+            return False
+        out = self._run(["loginctl", "show-session", sid, "-p", "LockedHint"])
+        if "LockedHint=" in out:
+            return out.strip().split("=", 1)[1].strip().lower() == "yes"
+        return False
+
+    def _fullscreen(self) -> bool:
+        out = self._run(["hyprctl", "activewindow", "-j"])
+        if not out.strip():
+            return False
+        win = json.loads(out)
+        # Hyprland reports 0 = none, 1 = maximized, 2 = fullscreen. Only real
+        # fullscreen counts: a maximized editor is just a window you made big.
+        return int(win.get("fullscreen") or 0) >= 2
+
+    def _other_audio(self) -> bool:
+        out = self._run(["pactl", "list", "short", "sink-inputs"])
+        lines = [l for l in out.splitlines() if l.strip()]
+        if not lines:
+            return False
+        # Our own playback is a sink-input too, so a naive count would gate
+        # every utterance behind the one before it. Piper's stream is owned by
+        # this process tree; anything else is somebody else's audio.
+        mine = self._own_sink_inputs()
+        return any(l.split("\t")[0].strip() not in mine for l in lines)
+
+    def _own_sink_inputs(self) -> set:
+        """Sink-input ids belonging to our own player, by client PID."""
+        own = set()
+        try:
+            out = self._run(["pactl", "list", "sink-inputs"])
+        except Exception:                            # noqa: BLE001
+            return own
+        current, pid = None, None
+        for line in out.splitlines():
+            s = line.strip()
+            if s.startswith("Sink Input #"):
+                if current is not None and pid == os.getpid():
+                    own.add(current)
+                current, pid = s.split("#", 1)[1].strip(), None
+            elif "application.process.id" in s and "=" in s:
+                try:
+                    pid = int(s.split("=", 1)[1].strip().strip('"'))
+                except ValueError:
+                    pid = None
+        if current is not None and pid == os.getpid():
+            own.add(current)
+        return own
+
+    PROBES = {
+        "screen_locked": "_screen_locked",
+        "fullscreen": "_fullscreen",
+        "other_audio": "_other_audio",
+    }
+
+    def blocked_by(self, priority: str) -> str | None:
+        """Name the first gate that closes on this priority, or None."""
+        s = self._settings()
+        if not s.get("enabled", True):
+            return None
+        for name, probe_attr in self.PROBES.items():
+            conf = s.get(name) or {}
+            if not conf.get("enabled", True):
+                continue
+            if priority in (conf.get("allow") or []):
+                continue
+            if self._cached(name, getattr(self, probe_attr)):
+                return name
+        return None
+
+
 # --------------------------------------------------------------------------
 # The broker
 # --------------------------------------------------------------------------
@@ -806,6 +1002,7 @@ class Broker:
 
         self.mic_ok = True
         self._mic_state = ""
+        self.gates = ContextGates(self.cfg)
         self._queue: list[tuple[int, int, Intent]] = []
         self._seq = 0
         self._cv = threading.Condition()
@@ -900,9 +1097,26 @@ class Broker:
             drop("disabled")
             return
 
-        if priority == "debug" and self.verbosity != "chatty":
-            drop("verbosity", f"debug intent at verbosity={self.verbosity}")
+        floor = VERBOSITY_FLOOR.get(self.verbosity, VERBOSITY_FLOOR["normal"])
+        if PRIORITY_RANK[priority] > PRIORITY_RANK[floor]:
+            drop("verbosity", f"{priority} intent at verbosity={self.verbosity}")
             return
+
+        # Checked before dedup and the rate limiter on purpose: an utterance
+        # nobody could hear should not consume a dedup slot or a rate budget
+        # that a later, audible one wants.
+        #
+        # `user_initiated` skips these entirely. The gates answer "is anyone in
+        # a position to hear this?", and someone who just pressed the read-aloud
+        # key has answered that themselves — refusing because a video is
+        # fullscreen would be the system overruling an explicit instruction.
+        # The mic gate is deliberately *not* skipped: it protects the dictation
+        # transcript, which pressing a key does not make safe.
+        if not obj.get("user_initiated"):
+            gate = self.gates.blocked_by(priority)
+            if gate is not None:
+                drop(f"gate_{gate}", f"{gate} — not speaking into it")
+                return
 
         if dedup_key:
             window = float(self.cfg["limits"]["dedup_window_secs"])
@@ -977,6 +1191,16 @@ class Broker:
             self._ack(conn, "ok", "reloaded")
         elif cmd == "ping":
             self._ack(conn, "ok", "pong")
+        elif cmd == "speaking":
+            # Asked by toggle-style callers (omarchy-tts-read-cursor) that need
+            # "is anything being said right now?" to decide between starting
+            # and stopping. They used to answer it from a pid file, which only
+            # ever knew about their own Piper process and so could not see an
+            # utterance the broker was playing on their behalf.
+            with self._cv:
+                busy = self._speaking is not None or bool(self._queue)
+                what = self._speaking.text[:60] if self._speaking else ""
+            self._ack(conn, "speaking" if busy else "idle", what)
         else:
             self._ack(conn, "error", f"unknown control {cmd!r}")
 
@@ -1031,6 +1255,7 @@ class Broker:
         LOG.configure(self.cfg)
         TRANSCRIPT.configure(self.cfg)
         self.player.latency_msec = int(self.cfg["audio"]["latency_msec"])
+        self.gates.configure(self.cfg)
         if old["voice"] != self.cfg["voice"]:
             LOG.info("config.voice_changed", "respawning piper")
             self._build_voices()

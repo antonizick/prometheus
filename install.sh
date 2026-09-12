@@ -13,6 +13,10 @@ BIN_DIR="$HOME/.local/bin"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/prometheus"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/prometheus"
+# prometheus-attention is a library, not a command — prometheus-hypr and
+# experiments/replay-scoring.py both import it from the repo by path, which is
+# what keeps the live scoring and the replay harness provably identical. It is
+# deliberately not symlinked into BIN_DIR: there is nothing to run.
 BINARIES=(prometheusd prometheus prometheus-toggle prometheus-boot prometheus-hypr prometheus-llm prometheus-phrasebank prometheus-claude prometheus-shell)
 UNITS=(prometheus.target prometheusd.service prometheus-boot.service prometheus-hypr.service prometheus-ollama.service)
 
@@ -117,3 +121,16 @@ Installed.
 Open a new shell (or \`source ~/.bashrc\`) to pick up the shell integration.
 Add the keybinds:   see $REPO/README.md
 EOF
+
+# Phase 5 (task 5.5) rewrote these to submit intents instead of spawning their
+# own Piper, so that only one thing ever holds the audio device (ADR-0001).
+# They are Omarchy's, not ours — this installer does not own or replace them —
+# but they now reference `prometheus`, so say so rather than leaving it to be
+# discovered. Each falls back to its original direct-Piper path when the broker
+# socket is absent, so an uninstall degrades them rather than breaking them.
+for legacy in omarchy-tts-read-cursor omarchy-tts-terminal-live; do
+  if [[ -e "$BIN_DIR/$legacy" ]] && grep -q 'prometheus say' "$BIN_DIR/$legacy" 2>/dev/null; then
+    echo "Note: $legacy routes speech through the broker."
+    echo "      Original preserved at $BIN_DIR/$legacy.pre-prometheus.bak"
+  fi
+done

@@ -118,6 +118,8 @@ def cmd_say(a) -> int:
         intent["ttl_ms"] = a.ttl
     if a.preempt:
         intent["preempt"] = True
+    if getattr(a, "user_initiated", False):
+        intent["user_initiated"] = True
     reply = send(intent, wait=a.wait)
     if a.wait and reply:
         print(f"{reply.get('status')}: {reply.get('detail', '')}".rstrip(": "))
@@ -201,7 +203,20 @@ def cmd_verbosity(a) -> int:
     return 0
 
 
-def cmd_status(_a) -> int:
+def cmd_status(a) -> int:
+    if getattr(a, "speaking", False):
+        # Machine-readable and quiet: one word on stdout, exit 0 when
+        # something is being said and 1 when nothing is. Meant for scripts
+        # that toggle (`omarchy-tts-read-cursor`), so it prints nothing else
+        # and never waits long.
+        reply = send({"control": "speaking"}, wait=True, timeout=2.0)
+        state = (reply or {}).get("status")
+        if state not in ("speaking", "idle"):
+            print("unknown")
+            return 2
+        print(state)
+        return 0 if state == "speaking" else 1
+
     enabled = read_state(ENABLED_FILE, "0")
     target = subprocess.run(["systemctl", "--user", "is-active", TARGET],
                             capture_output=True, text=True).stdout.strip()
@@ -1343,6 +1358,11 @@ def main() -> int:
     p.add_argument("--dedup-key", default=None)
     p.add_argument("--ttl", type=int, default=0, metavar="MS")
     p.add_argument("--preempt", action="store_true")
+    p.add_argument("--user-initiated", action="store_true",
+                   help="someone pressed a key for this — skip the context "
+                        "gates (locked screen, fullscreen, other audio), which "
+                        "exist to judge whether anyone wants to be spoken to. "
+                        "Never skips the microphone gate.")
     p.add_argument("--wait", action="store_true",
                    help="wait for the daemon to report the outcome")
     p.set_defaults(func=cmd_say)
@@ -1353,10 +1373,15 @@ def main() -> int:
         ("on", cmd_on, "power on (starts the systemd units)"),
         ("off", cmd_off, "power off (stops every process, frees VRAM)"),
         ("toggle", cmd_toggle, "flip the power switch"),
-        ("status", cmd_status, "show state, units, processes and RSS"),
     ):
         sp = sub.add_parser(name, help=helptext)
         sp.set_defaults(func=fn)
+
+    p = sub.add_parser("status", help="show state, units, processes and RSS")
+    p.add_argument("--speaking", action="store_true",
+                   help="print just 'speaking' or 'idle' and exit 0/1; for "
+                        "scripts that toggle read-aloud on the same key")
+    p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("verbosity", help="get, set or cycle verbosity")
     p.add_argument("level", nargs="?", choices=[*VERBOSITIES, "cycle"])

@@ -42,7 +42,60 @@
       "responding", "online", "restored", "resumed", "surfaced", "visible",
       "focused", "initialised", "initialized", "status", "successfully",
       "please", "sorry", "oops", "great", "awesome", "unfortunately",
-      "he", "him", "his", "user", "nick"
+      "he", "him", "his", "user", "nick",
+
+      // Added in Phase 5, after a regeneration audit. The first list above
+      // catches models reaching for *corporate* vocabulary; this catches them
+      // reaching for *computer-science* vocabulary, which is a distinct habit
+      // and was untouched. Nine of the fourteen lines cut in that audit came
+      // from this one cluster:
+      //   "New {app} process launched."      "{app} session beginning."
+      //   "New {app} session initiated."     "That {app} session's on."
+      //   "Claude's input queue empty."      "Another thread asking from Claude…"
+      // docs/06 principle 3: a session and a queue are not things you hear
+      // about, they are things a program has. He knows he opened an app; being
+      // told a "process launched" is the same fact in a worse costume.
+      "session", "sessions", "process", "processes", "thread", "threads",
+      "queue", "queued", "buffer", "daemon", "socket", "initiated",
+      "launched", "terminated", "executed",
+
+      // "we" joins "i" (already in unknowable_words) — there is no we.
+      // From: "We need to plug in soon; {percent} battery."
+      "we", "our", "us",
+
+      // A computer with a mood, which docs/06 names as the failure mode to
+      // avoid at *any* register. The first regeneration under the rules above
+      // produced a fresh crop of these, so the habit survives a vocabulary ban
+      // aimed elsewhere and needs a list of its own:
+      //   "Might need coffee later for that {app} session."
+      //   "{app}, humming quietly tonight."
+      //   "That's {app} humming along."      "{app} runs quietly again."
+      //   "Nothing touched in {app} still."
+      // Personification is the specific tell. An application does not hum, and
+      // persona.md's "Dry. Observant." leaves no room for it at any register.
+      "coffee", "tired", "sleepy", "hope", "afraid", "worry", "worried",
+      "humming", "hums", "whisper", "whispers", "sleeps", "sleeping",
+      "dreams", "breathes", "sighs", "lonely", "eager", "happy", "sad",
+      "quietly", "softly", "gently", "peacefully", "faithful", "weary",
+      "restless", "patient", "touched", "untouched", "abandoned",
+      "neglected", "forgotten",
+
+      // Guessing about the future, which it can see no better than the past it
+      // also cannot see. From the fourth regeneration:
+      //   "Long night ahead in {app}."     "It's going to be {app} day."
+      //   "Complex task likely for {app} now."
+      //   "Audio work usually later day: {app}."
+      // battery_low allows "soon" — a warning whose whole content is "you will
+      // need a cable shortly" is the one moment where saying what happens next
+      // is the entire point.
+      // Narrowed after this list rejected three lines it should not have:
+      //   "{app}. That doesn't happen often."   <- app_rare, and TRUE
+      //   "Unusual for {app} tonight."          <- app_odd_hour, and TRUE
+      // "often", "usually", "typically" and "tonight" describe the present or
+      // the past, not the future — and app_rare's whole job is to say that
+      // something does not happen often. Only words that claim to know what
+      // happens NEXT belong here.
+      "ahead", "likely", "expect", "expected", "gonna", "upcoming", "tomorrow"
     ],
 
     // Things the system cannot possibly know. This is the failure the
@@ -64,7 +117,43 @@
       "i", "something", "somewhere", "system", "network", "hardware",
       "cpu", "memory", "disk", "instance", "instructions", "console",
       "log", "logs", "output", "results", "minute", "minutes", "hour",
-      "hours", "clock", "things", "background"
+      "hours", "clock", "things", "background",
+
+      // Added in Phase 5, from auditing the bank that was actually generated
+      // rather than imagining what a model might write. Every word below got
+      // past the list above and was banked. The lines, verbatim:
+      //   "Files changed, {app}."             <- for a window gaining focus
+      //   "{app} blinks briefly."
+      //   "Prompt waiting patiently in {app}."
+      //   "{app} waiting patiently."
+      //   "{app}'s been left running, waiting."
+      // The failure mode is consistent and worth naming: asked to say
+      // something about a bare focus change, the model reaches for a detail
+      // that would make it interesting, and every available detail is one it
+      // invented. `waiting` and `prompt` stay legal for claude_blocked and
+      // claude_blocked_project through their allow_words, where they are the
+      // literal truth rather than a guess.
+      "file", "files", "changed", "change", "unsaved", "saved", "save",
+      "blink", "blinks", "blinking", "prompt", "prompts",
+      "waiting", "waits", "patiently", "running", "idle", "busy",
+      "unread", "inbox", "error", "errors", "warning", "warnings",
+
+      // On-screen furniture it cannot see, from the same regeneration:
+      //   "Claude's input field cleared."
+      // Note "input" itself is NOT here — "Claude awaits input." is the
+      // literal truth about a blocked agent and is exactly what docs/06 wants
+      // that alert to say. It is the *field* that is invented, not the input.
+      "field", "fields", "button", "buttons", "box", "panel", "pane",
+      "icon", "icons", "menu", "menus", "toolbar", "widget",
+
+      // Fifth regeneration, same habit wearing new words:
+      //   "Brave's interface shows itself."   <- it cannot see an interface
+      //   "The timer's still counting for Brave."  <- there is no timer
+      // "progress" was here briefly and rejected "Couldn't make progress on
+      // {command}." — which is idiomatic English, not invented furniture. The
+      // UI sense is "progress bar", and "bar" is already covered above.
+      "interface", "interfaces", "timer", "timers", "countdown",
+      "scrollbar", "titlebar", "layout"
     ],
 
     // Lines that tell him to do something. He did not ask for help and is not
@@ -287,6 +376,12 @@
     {
       "id": "claude_blocked",
       "target": 20,
+      // A blocked agent is STOPPED. Words that imply it is still working
+      // report the outcome backwards — the exact failure the acceptance
+      // criteria name. From the fifth regeneration:
+      //   "Claude processing input on {project}."
+      "banned_extra": ["processing", "working", "thinking",
+                             "computing", "busy", "continuing", "proceeding"],
       "must_include_any": ["claude"],
       "moment": "A Claude Code session has stopped and is waiting for an answer. Nothing moves until it gets one. This is the single most valuable thing the system ever says, so it must be instantly recognisable as a summons.",
       "slots": {},
@@ -306,6 +401,12 @@
     {
       "id": "claude_blocked_project",
       "target": 20,
+      // A blocked agent is STOPPED. Words that imply it is still working
+      // report the outcome backwards — the exact failure the acceptance
+      // criteria name. From the fifth regeneration:
+      //   "Claude processing input on {project}."
+      "banned_extra": ["processing", "working", "thinking",
+                             "computing", "busy", "continuing", "proceeding"],
       "must_include_any": ["claude"],
       "moment": "A Claude Code session is waiting for an answer, and there is more than one session running, so the project has to be named to say which.",
       "slots": { "project": ["Prometheus", "ASCII Art Studio", "Research"] },
@@ -383,7 +484,7 @@
     {
       "id": "battery_low",
       "target": 16,
-      "allow_words": ["battery"],
+      "allow_words": ["battery", "soon"],
       "moment": "The battery is low enough to be worth mentioning. The percentage is the only number worth saying.",
       "slots": { "percent": ["ten percent", "fifteen percent"] },
       "max_words": 9,
@@ -404,7 +505,10 @@
       "moment": "A briefing was asked for, and nothing at all has happened since the last one.",
       "slots": { "span": ["fifteen minutes", "an hour"] },
       "max_words": 9,
-      "allow_words": ["hour", "hours", "minute", "minutes"],
+      // "change" is the one moment where it is not invented: a briefing that
+      // found nothing genuinely knows nothing changed — that is its entire
+      // content. Added in Phase 5 alongside the tightened global list.
+      "allow_words": ["hour", "hours", "minute", "minutes", "change", "changed"],
       "seeds": [
         "Quiet for the last {span}.",
         "Nothing in the last {span}.",

@@ -100,13 +100,33 @@ harness runs the attention scoring over your *real* journal history and tells
 you what would have been spoken:
 
 ```bash
-experiments/replay-scoring.py                  # current weights
+experiments/replay-scoring.py                  # current config
 experiments/replay-scoring.py --rate 0.05      # what 5% would have felt like
 experiments/replay-scoring.py --verbose        # per-event: spoke / stayed quiet, and why
+experiments/replay-scoring.py --verbosity quiet  # what a tier actually yields
+experiments/replay-scoring.py --hourly         # utterances per hour, and the worst hour
+experiments/replay-scoring.py --compare        # the pre-Phase-5 scoring, side by side
 ```
 
 This is the cheapest tuning you can do, and the only kind that uses evidence
 instead of imagination. Run it before asking for a change to the weights.
+
+Two lines in the output are worth reading before any of the others:
+
+```
+would speak     : 9/54 (16.7% achieved)      <- is the rate dial being honoured?
+carried a reason: 9/9 (100%)                 <- or is it just a coin flip?
+```
+
+The second is the one that matters. An utterance with no reason behind it is a
+random remark wearing the costume of an observation, and before Phase 5 **more
+than half of them were exactly that**. If that percentage drops, the scoring has
+stopped selecting for interest even if the volume still feels right.
+
+The scoring itself lives in `bin/prometheus-attention` and is **imported** by
+both this harness and the live listener, so what the replay predicts and what
+the system does are the same arithmetic rather than two implementations that
+agree until they don't.
 
 ### Checking nothing broke
 
@@ -199,9 +219,27 @@ app — find the class with `prometheus log -f` while focusing the window.
 
 #### "It should be quieter about everything, right now" → verbosity
 
-`SUPER + ALT + V` cycles `quiet → normal → chatty` live. `quiet` is workspace
-switches only. This is the dial for a bad afternoon, not for a preference —
-preferences belong in the config file, where they survive a reboot.
+`SUPER + ALT + V` cycles `quiet → normal → chatty` live. This is the dial for a
+bad afternoon, not for a preference — preferences belong in the config file,
+where they survive a reboot.
+
+It does two things at once, and they are separate mechanisms:
+
+| tier | ambient events it may narrate | lowest priority it will speak |
+|---|---|---|
+| `quiet` | app launches only — **0.1/hour** | `normal` (no ambient at all) |
+| `normal` | + focus changes — **1.2/hour** | `ambient` |
+| `chatty` | + workspace, fullscreen, monitor — **4.7/hour** | `debug` |
+
+Nothing in this table can silence a blocked agent. `critical` is exempt at every
+tier, because that alert is what the system is for. Silencing it is what the
+power switch is for.
+
+> Before Phase 5 this gated only `debug`, so `quiet` and `normal` behaved
+> **identically** — two of the key's three positions did nothing. And `quiet`
+> was defined as "workspace switches only", which turned out to mean the
+> quietest setting narrated the *most frequent* event on the desktop. Both
+> fixed; see [notes/2026-09-12-phase-5.md](../notes/2026-09-12-phase-5.md).
 
 And `SUPER + ALT + X` cuts the current utterance mid-word, instantly,
 without disabling anything. Use it freely; it's what makes leaving the system
@@ -210,12 +248,28 @@ on tolerable.
 ### What to do at a week, a month, six months
 
 **After a week.** You will have a handful of `prometheus feedback` notes and a
-real journal. **One question is already waiting for you at this point**, parked
-deliberately rather than guessed at:
+real journal. **Two questions are already waiting for you at this point**, both
+answered provisionally in Phase 5 from measurement and both genuinely settled
+only by ear:
 
-> `speak.claude_finished.min_turn_secs` is `0`, so it speaks after *every*
-> Claude Code turn. If that has been grating, raise it — 60 means it only
-> speaks when you have plausibly looked away. If it hasn't, leave it.
+> **1. Is it too quiet?** `attention.require_reason` includes `"focus"`, which
+> means a focus change with nothing notable about it stays silent. That is
+> 1.2 utterances an hour. Removing `"focus"` from the list gives 4.1. If a week
+> has gone by and you have barely heard it, this is the dial — not
+> `target_rate`, which changes the ratio and not the eligibility.
+>
+> **2. Does it speak after Claude turns you were watching?**
+> `speak.claude_finished.min_turn_secs` is `45`, measured from 154 real turns
+> on this machine (median 52 s), so it speaks after roughly half of them. Your
+> own numbers are now recorded — every Stop logs `turn_secs` whatever the
+> threshold:
+>
+> ```bash
+> prometheus log | grep -o 'turn_secs[^,}]*' | sort -t: -k2 -n | tail -20
+> ```
+>
+> Raise it toward 60–90 if it still speaks when you hadn't looked away; drop it
+> to `0` to hear every turn again.
 
 Read your notes and the replay together:
 
@@ -229,7 +283,21 @@ Look for *one* pattern, not five. The likely ones: it's too chatty (lower
 particular application is noise (delete it from `app_names`). Make one change.
 
 **After a month.** By now you'll have opinions about wording, not just volume.
-This is the point to re-run the listening review and cut what grates:
+This is the point to re-run the listening review and cut what grates.
+
+> **Run the audit routine in [06](06-voice-and-tone.md) first**, and run it
+> after *every* regeneration, not just this one. Phase 5 needed five
+> regenerations, and each produced a genuinely new family of bad phrasings once
+> the previous family was blocked — invented detail, then computer-science
+> vocabulary, then personification, then the system naming itself and guessing
+> about the future, then on-screen furniture and a *polarity* error that
+> described a blocked agent as "processing". **A validator tightened against
+> what the model did last time tells you nothing about where it will go next.**
+> Fifty-three lines were cut that way; **not one was hand-written.**
+>
+> The bank is therefore left clean, not converged. Expect the audit to find
+> something most times you run it, and treat that as the routine working rather
+> than as a problem.
 
 ```bash
 experiments/build-phrasebook-audio.py
@@ -282,7 +350,7 @@ parts, because there are three files and only two of them are yours.
 | File | What it is | Edit it? |
 |---|---|---|
 | `~/.config/prometheus/phrasebank-spec.json` | **The source.** The 17 moments, and eight-plus hand-written phrasings for each. | **Yes — this is the one you want.** |
-| `~/.local/state/prometheus/phrasebank.json` | The **generated** bank — 284 phrasings, what it actually reads from. | Editable, but overwritten by the next `regenerate`. |
+| `~/.local/state/prometheus/phrasebank.json` | The **generated** bank — ~280 phrasings, what it actually reads from. | Editable, but overwritten by the next `regenerate`. |
 | `~/.local/state/prometheus/phrasebank-vetoed.json` | Lines you've cut by ear. Never re-banked. | Managed by `veto`; hand-editable. |
 
 **The trap to avoid:** hand-editing `phrasebank.json` works, and takes effect
@@ -356,7 +424,13 @@ the bank is the build output.
 | You say | Do this |
 |---|---|
 | "It's too chatty." | `target_rate` → `0.08`. Live with it a day. |
+| "It's too *quiet* — I never hear it." | Remove `"focus"` from `attention.require_reason`. Measured: 1.2 → 4.1 utterances/hour. This is the first dial to reach for in that direction, not `target_rate`. |
+| "It talks while I'm watching something." | It shouldn't — `context_gates.fullscreen` covers that. Check `prometheus transcript -v` for a `gate_fullscreen` drop; if there isn't one, the window was maximized rather than fullscreen, which is deliberately not the same thing. |
+| "It spoke while the screen was locked." | A bug. `prometheus transcript -v` will show whether the gate fired; `loginctl show-session $(loginctl show-user $USER -p Display --value) -p LockedHint` is what it reads. |
+| "It talks over music." | `context_gates.other_audio` should stop it. If music is *wanted* as background, set its `allow` to `["critical","normal"]`. |
+| "It narrates every workspace switch." | It shouldn't since Phase 5 — those are `chatty`-only and settle-debounced. If you're on `chatty` and want them gone, drop `"workspace"` from `attention.verbosity_kinds.chatty`. |
 | "It interrupts when I'm concentrating." | `quiet_period_secs` → `120`. |
+| "It speaks after every trivial Claude turn." | Raise `speak.claude_finished.min_turn_secs`. `prometheus log \| grep turn_secs` shows your own distribution first. |
 | "It talks while I'm dictating." | That's a bug, not a setting — mic gating is supposed to be absolute. Tell me. |
 | "Stop mentioning Discord." | Delete `"discord"` from `hypr.app_names`. |
 | "I hated that specific sentence." | `prometheus-phrasebank veto <moment> "<the words>"` |
@@ -401,12 +475,24 @@ the bank is the build output.
 ~/.local/state/prometheus/
 ├── phrasebank.json         the generated bank — build output, not source
 ├── phrasebank-vetoed.json  lines you cut by ear, permanently
+├── attention-gain.json     the rate controller's learned gain — see below
 ├── feedback.jsonl          your notes, with evidence attached
 ├── transcript.jsonl        everything said — and dropped, with reasons
 ├── journal                 what the desktop did
 └── *.log                   per-component reasoning, including every phrase
                             candidate and why it was accepted or rejected
 ```
+
+`attention-gain.json` is the one file here you might be tempted to edit and
+shouldn't. It holds what the rate controller has learned about how often your
+desktop produces interesting events, so a restart doesn't re-converge from
+scratch.
+
+**Deleting it is safe** — it rebuilds over a few dozen events — and is the right
+move if you have changed the attention weights substantially and want it to
+forget the old shape. Editing it is not: `k` in that file is a *derived* value,
+recomputed from `correction` and `mean_raw` every time it is read, so a number
+you put there is overwritten before it is ever used.
 
 Config and state are left alone by `./install.sh --uninstall`, so none of your
 tuning is at risk from a reinstall.

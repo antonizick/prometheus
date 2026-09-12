@@ -405,6 +405,27 @@ def validate(text: str, ev: dict, accepted: list[str]) -> tuple[bool, str]:
     for w in ev["banned_words"]:
         if f" {w.lower()} " in low:
             return False, f"banned_word:{w}"
+
+    # Contractions hide banned words from the check above. `normalise` closes
+    # apostrophes up so "didn't" stays one token — deliberately, so an anchor
+    # like "didn" can match it — but that also turns "he's" into "hes", which
+    # " he " never matches. Phase 5 found the consequence in the live bank:
+    #
+    #     "He's stuck in {project} - Claude."
+    #
+    # `he` / `him` / `his` are banned precisely to stop the system referring to
+    # Nick in the third person, and this is the most valuable alert the system
+    # has. It is wrong twice over — Claude is stuck, not "he".
+    #
+    # Matched against the ORIGINAL text, on a literal apostrophe. Matching the
+    # normalised form instead was the first attempt and it rejected
+    # "a well-timed question": normalise turns the hyphen into a space, and
+    # "well" then reads as "we" + "ll". The apostrophe is the thing that makes
+    # it a contraction, so require one.
+    for w in ev["banned_words"]:
+        if re.search(r"\b%s['’](?:s|d|ll|re|ve|m)\b" % re.escape(w.lower()),
+                     text, re.I):
+            return False, f"banned_word_contraction:{w}"
     # The important one: a phrasing that mentions something the system cannot
     # observe is fiction, however well it reads.
     for w in ev.get("unknowable_words", []):
@@ -451,7 +472,71 @@ def validate(text: str, ev: dict, accepted: list[str]) -> tuple[bool, str]:
             rendered = render(text, {slot: val}, finish=False)
             if re.search(r"\b(the|a|an)\s+the\b", rendered, re.I):
                 return False, f"double_article:{val}"
+
+    # A proper noun pluralised where a possessive was meant. Phase 5 banked
+    # "Claudes awaits your response." — the missing apostrophe is invisible on
+    # the page and unmistakable out loud, which is exactly the class of defect
+    # a text-only review misses and a listening review catches. Cheaper to
+    # catch here than to keep catching by ear.
+    if re.search(r"\b(Claude|Prometheus|Lucent|Brave|Discord|Obsidian)s\b", text):
+        return False, "plural_proper_noun"
+
+    # Ends like a sentence. "{app} session freshly started" was banked with no
+    # terminal punctuation at all, which the broker's sentence splitter then
+    # runs into the utterance after it.
+    if not text.rstrip().endswith((".", "!", "?", "…")):
+        return False, "no_terminal_punctuation"
+
+    # An em-dash needs a space either side. The seeds all write it that way,
+    # and Phase 5 caught the live bank speaking a line that didn't:
+    #
+    #     "Claude's waiting on your input— {project}."   -> "input— Prometheus"
+    #
+    # Spotted in `prometheus transcript`, not in the bank, which is the point:
+    # it reads as a typo on the page and lands as a missing beat out loud.
+    if re.search(r"\S—|—\S", text):
+        return False, "dash_spacing"
+
+    # A spaced hyphen where an em-dash was meant. Same intent, different
+    # character, and the bank had both — "Answer needed for Claude - {project}."
+    # against the seeds' "Claude needs you — {project}." Piper phrases them
+    # differently, so the inconsistency is audible, not merely untidy.
+    if re.search(r"\s-\s", text):
+        return False, "hyphen_as_dash"
+
+    # The system talking about itself, in the third person, by name:
+    #
+    #     "Lucent is aware Brave is opening."
+    #
+    # docs/01-architecture.md states it flatly — "Never narrate Prometheus's own
+    # activity" — and this is the worse version, because it also announces what
+    # it is about to say, which docs/06 principle 4 forbids separately. The
+    # authoring prompt tells the model the system's name so it can refer to
+    # *itself* in first person where that is wanted; this is that going wrong.
+    #
+    # Checked against the configured identity rather than a fixed word, so it
+    # keeps working after `prometheus name "Athena"`. `claude_blocked_project`
+    # is exempt: {project} legitimately renders as the project's name, which on
+    # this machine is often the same word.
+    if ev["id"] != "claude_blocked_project":
+        for name in identity_names():
+            if re.search(r"\b%s\b" % re.escape(name), text, re.I):
+                return False, f"self_narration:{name}"
+
     return True, "ok"
+
+
+_IDENTITY_CACHE: list | None = None
+
+
+def identity_names() -> list:
+    """What this system currently calls itself, written and spoken."""
+    global _IDENTITY_CACHE
+    if _IDENTITY_CACHE is None:
+        ident = (load_config().get("identity") or {})
+        names = [ident.get("name"), ident.get("spoken_as"), "prometheus"]
+        _IDENTITY_CACHE = [n.lower() for n in names if n and len(n) > 2]
+    return _IDENTITY_CACHE
 
 
 # --------------------------------------------------------------------------

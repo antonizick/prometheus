@@ -1,0 +1,642 @@
+#!/usr/bin/env python3
+"""Interest scoring — the decision of whether a desktop event is worth saying.
+
+Shared, deliberately, by two callers that must never disagree:
+
+    bin/prometheus-hypr            the live path — scores an event as it happens
+    experiments/replay-scoring.py  the offline path — scores journalled history
+
+That sharing is the whole point. A replay harness that models the live rules
+approximately is worse than none, because it produces confident numbers about a
+system that doesn't exist. Both callers import this file, so "what the replay
+said would happen" and "what happens" are the same arithmetic.
+
+Imported by SourceFileLoader (these are extension-less executables, matching
+experiments/test-phrasebank.py):
+
+    loader = importlib.machinery.SourceFileLoader("attn", ".../prometheus-attention")
+
+---------------------------------------------------------------------------
+Why these signals and not the ones in docs/08
+---------------------------------------------------------------------------
+
+docs/08-personality-and-config.md proposed novelty / rarity / odd-hour /
+return-after-absence / sequence-oddity. Phase 5 replayed them against 7.5 hours
+of real journal (247 scorable events) and measured how often each actually
+fires:
+
+    novel-today     5/247   ( 2.0%)
+    rare            9/247   ( 3.6%)
+    odd-hour       30/247   (12.1%)
+    returned        0/247   ( 0.0%)   <- at the 3600s threshold it never fires
+    rapid-switch   44/247   (17.8%)   <- a penalty, the only one doing work
+
+Of 23 utterances the old scoring would have produced, **12 carried no interest
+signal at all** — they were bare draws at the base rate. The scoring was not
+selecting for interest; it was a 15% random sampler with a mild late-night bias.
+
+The cause is a denominator that doesn't exist. Novelty and rarity are per-app
+signals, and Nick's real day is three apps (terminal 131, Claude Code 68,
+Brave 48). After the first hour nothing is novel and nothing is rare, ever
+again. They are one-shot-per-day signals on a machine that runs one long day.
+
+What *does* vary in the real journal is the shape of the session, not the app:
+
+    dwell between focus changes   p25 5s | p50 17s | p75 89s | p90 235s | max 3454s
+
+That spread is discriminating power. A focus change after eleven minutes in one
+window is a genuinely different event from the fourth alt-tab in six seconds,
+and the difference is knowable at the moment it happens with no lookahead.
+
+So two signals are added and one is repaired:
+
+    dwell_boost    previous dwell > dwell_secs (300s)   17/247  ( 8.1%)
+    return_boost   gap since any activity > return_secs (600s)  8/247 ( 3.2%)
+
+`return_boost` is `returned` with a threshold taken from the data instead of
+from intuition — 3600s fires never because the longest real gap is 3454s. It
+also gets its own weight; the old code multiplied by `novelty_boost`, which
+quietly coupled two dials that docs/08 promises are independent.
+
+Novelty, rarity and odd-hour are kept. They fire rarely, but when they fire
+they are right, and they cost nothing. They are simply no longer load-bearing.
+
+---------------------------------------------------------------------------
+Normalization — why there is a controller and not a constant
+---------------------------------------------------------------------------
+
+docs/08 promises: "The overall rate is then normalized to hit the configured
+target, so tuning the factors changes *which* events get spoken without
+changing *how often* it speaks."
+
+The old implementation set `k = target_rate / mean_raw` once and multiplied.
+That does not hit the target, because the quiet-period floor and the recency
+penalty then remove a large fraction of the draws *after* normalization.
+Measured: a 15% target achieved 9.3%. The promise was not kept, and tuning a
+weight therefore moved the volume too — the two dials were coupled.
+
+`RateController` closes the loop instead. It tracks the achieved rate over a
+trailing window and nudges `k` multiplicatively toward the target, so the gates
+are inside the loop rather than downstream of it. It converges in minutes of
+real time, persists across restarts (the gain is a single float in the state
+dir), and is clamped so a pathological journal can't drive it to infinity.
+
+Offline, `solve_k()` does the same job by bisection over the whole history,
+which is exact and is what the replay harness reports.
+"""
+
+from __future__ import annotations
+
+import collections
+import datetime
+import json
+import math
+import os
+import random
+
+# --------------------------------------------------------------------------
+# Defaults. Every one of these is overridable from config.json -> attention.
+# Values that differ from docs/08 are marked with the measurement that moved
+# them; see notes/2026-09-12-phase-5.md.
+# --------------------------------------------------------------------------
+
+DEFAULT_ATTENTION = {
+    # boosts
+    "novelty_boost": 2.0,          # first sighting of this app today
+    "rarity_boost": 1.5,           # <= RARE_THRESHOLD prior sightings ever
+    "odd_hour_boost": 1.8,         # before 06:00 or after 23:00
+    "return_boost": 2.5,           # NEW weight (was silently reusing novelty_boost)
+    "dwell_boost": 2.0,            # NEW — the signal with real discriminating power
+
+    # penalties
+    "recent_speech_penalty": 0.15,
+    "repetition_penalty": 0.4,
+    "rapid_switch_penalty": 0.1,
+
+    # thresholds
+    "quiet_period_secs": 45,       # hard floor between ambient utterances
+    "return_secs": 600,            # 3600 never fired; longest real gap was 3454s
+    "dwell_secs": 300,             # p90 of real dwell is 235s, so this is the tail
+}
+
+DEFAULT_TARGET_RATE = 0.15
+
+# Event kinds that go through the probability gate at all.
+SCORED_KINDS = ("open", "close", "focus", "fullscreen", "workspace")
+
+RARE_THRESHOLD = 2             # at most this many prior sightings still counts as rare
+REPETITION_WINDOW_SECS = 600   # how far back "you already said that" looks
+SOFT_SUPPRESS_MULT = 3         # x quiet_period_secs: hard floor fades to normal
+
+# --------------------------------------------------------------------------
+# The verbosity ladder
+# --------------------------------------------------------------------------
+#
+# docs/01-architecture.md specified:
+#
+#     quiet  — workspace switches only
+#     normal — + app launches and closes
+#     chatty — + focus changes, fullscreen, monitor changes
+#
+# That ladder assumed workspace switches are the rarest and most deliberate
+# desktop event, which is why they were the always-on floor. The Phase 5
+# journal says they are the opposite — the *most* frequent thing that happens,
+# 90 in 7.5 hours against 6 app launches, and the one whose content is already
+# on screen in the bar you are looking at.
+#
+# Left alone, that composition breaks the tier mechanically rather than just
+# aesthetically: the rate controller speaks a fixed fraction of *eligible*
+# events, so when 53 of 59 eligible events at `normal` are workspace switches,
+# ~90% of everything the system says is a workspace number. Measured on the
+# real journal: 17 of 20 utterances were "Two, then." / "Three now." / "One."
+#
+# So the tiers are re-cut on what an utterance is *worth*, which is what the
+# original ladder was reaching for, rather than on how often its kind fires:
+#
+#     quiet  — app launches only. Deliberate, rare, roughly one an hour at most.
+#     normal — + focus changes. Where the interest signals actually live
+#              (returned / long-dwell / rare), and a phrasing that names the
+#              app tells you something a glance at the bar does not.
+#     chatty — + workspace, fullscreen, monitor. Everything, including the
+#              events whose content you can already see.
+#
+# `close` is in no tier: docs/06 has closing a window saying nothing, because
+# you were there when it happened. It stays journalled, just never spoken.
+#
+# Overridable from config.json -> attention.verbosity_kinds, so moving a kind
+# between tiers is an edit rather than a rebuild.
+VERBOSITY_KINDS = {
+    "quiet":  {"open"},
+    "normal": {"open", "focus"},
+    "chatty": {"open", "focus", "workspace", "fullscreen", "monitor"},
+}
+
+# Kinds that must carry a real interest signal, not just win a probability
+# draw. A bare focus change is the case docs/06 principle 6 is about — "he
+# knows he just switched windows" — so an uninteresting one stays quiet even
+# when the tier would allow it and the draw would have gone its way.
+#
+# This is the loudest dial in the file, and it is set conservatively on
+# purpose. Measured on the Phase 5 journal at `normal`:
+#
+#     focus not listed here   4.1 utterances/hour, 59% carrying a reason
+#     focus listed here       1.2 utterances/hour, 100% carrying a reason
+#
+# docs/06 opens with "Silence is the default. Every utterance has to earn its
+# place against the alternative of staying quiet", and docs/08 records the open
+# risk that varied phrasing is *harder* to tune out than fixed phrasing, not
+# easier. Both point the same way for a first week of real use. Turning this
+# up after a quiet week is a much easier conversation than turning it down
+# after an irritating one.
+#
+# To hear more: config.json -> attention.require_reason: ["workspace",
+# "fullscreen"]. That is the 4.1/hour number above.
+DEFAULT_REQUIRE_REASON = {"focus", "workspace", "fullscreen"}
+
+# Gain bounds for the live controller. Wide enough to correct a badly-tuned
+# weight set, narrow enough that a strange hour can't run away with the volume.
+K_MIN, K_MAX = 1e-3, 50.0
+
+
+def attention_from_config(cfg: dict) -> dict:
+    """Merge config.json's attention block over the defaults."""
+    attn = dict(DEFAULT_ATTENTION)
+    attn.update((cfg or {}).get("attention", {}) or {})
+    return attn
+
+
+def target_rate_from_config(cfg: dict) -> float:
+    try:
+        return float((cfg or {}).get("speak", {})
+                     .get("desktop_activity", {})
+                     .get("target_rate", DEFAULT_TARGET_RATE))
+    except (TypeError, ValueError):
+        return DEFAULT_TARGET_RATE
+
+
+def kinds_for_verbosity(verbosity: str, cfg: dict | None = None) -> set:
+    """Which event kinds this tier may speak about.
+
+    config.json -> attention.verbosity_kinds overrides a tier wholesale, so
+    putting workspace switches back on the `quiet` floor (or taking focus
+    changes off `normal`) is a config edit.
+    """
+    override = ((cfg or {}).get("attention", {}) or {}).get("verbosity_kinds", {})
+    if verbosity in override:
+        return set(override[verbosity])
+    return VERBOSITY_KINDS.get(verbosity, VERBOSITY_KINDS["normal"])
+
+
+def require_reason_kinds(cfg: dict | None = None) -> set:
+    override = ((cfg or {}).get("attention", {}) or {}).get("require_reason")
+    return set(override) if override is not None else set(DEFAULT_REQUIRE_REASON)
+
+
+def meaningful_reasons(reasons: list[str]) -> list[str]:
+    """Reasons that make an event *interesting*, excluding the penalties.
+
+    `rapid-switch` is a reason the score moved, but it is a reason to say
+    less, not a reason the event is worth mentioning — counting it as signal
+    would make alt-tab hunting the most narratable thing on the desktop.
+    """
+    return [r for r in reasons if not r.startswith("rapid-switch")]
+
+
+# --------------------------------------------------------------------------
+# Pass 1 — raw interest, causal only
+# --------------------------------------------------------------------------
+
+class Scorer:
+    """Accumulates the history an interest score needs.
+
+    Stateful and chronological on purpose: the live path feeds it one event at
+    a time as they happen, and the replay feeds it a journal in order. Neither
+    may look ahead, so `score()` only ever consults what it has already seen.
+    """
+
+    def __init__(self, attn: dict):
+        self.attn = attn
+        self.counts: collections.Counter = collections.Counter()
+        self.seen_day: dict[str, str] = {}
+        self.last_any_t: float | None = None
+        self.last_focus_t: float | None = None
+
+    def seed_from_journal(self, path: str, max_lines: int = 4000) -> int:
+        """Absorb today's journalled history without scoring any of it.
+
+        The toggle is a power switch, not a mute — `prometheus off` genuinely
+        stops these processes (docs/07, ADR-0002). So every toggle-on starts a
+        Scorer with no memory, and for the next several events every app is
+        "first time today" and "rarely used" despite having been open all day.
+
+        With `require_reason` on, those inflated events are precisely the ones
+        that get spoken, so the symptom is a little burst of *"Brave, first
+        time today"* about applications used continuously since breakfast —
+        every single time the system is switched on. Measured on this
+        machine's journal: roughly six such events per restart.
+
+        The journal is the memory these processes don't have, so read it.
+        Returns how many events were absorbed, for the startup log.
+        """
+        try:
+            with open(path) as f:
+                lines = f.readlines()[-max_lines:]
+        except OSError:
+            return 0
+        today = datetime.date.today().isoformat()
+        n = 0
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            t = rec.get("t")
+            if not t or datetime.date.fromtimestamp(t).isoformat() != today:
+                continue
+            if rec.get("kind") not in SCORED_KINDS:
+                continue
+            app = event_app(rec)
+            if not app:
+                continue
+            # Counts and last-seen only. Deliberately not `last_any_t` or
+            # `last_focus_t`: after a restart the gap since the journal's last
+            # entry is real elapsed time, and coming back to a machine that was
+            # switched off for an hour genuinely *is* a return.
+            self.counts[app] += 1
+            self.seen_day[app] = today
+            n += 1
+        return n
+
+    def score(self, t: float, kind: str, app: str, coalesced: int = 0) -> dict:
+        """Return {"raw": float, "reasons": [str]} for one event, then absorb it."""
+        a = self.attn
+        dt = datetime.datetime.fromtimestamp(t)
+        day = dt.date().isoformat()
+
+        raw = 1.0
+        reasons: list[str] = []
+
+        if self.seen_day.get(app) != day:
+            raw *= a["novelty_boost"]
+            reasons.append("novel-today")
+
+        if self.counts[app] <= RARE_THRESHOLD:
+            raw *= a["rarity_boost"]
+            reasons.append("rare")
+
+        if dt.hour < 6 or dt.hour >= 23:
+            raw *= a["odd_hour_boost"]
+            reasons.append("odd-hour")
+
+        # Returned after a real absence. Own weight, own threshold — docs/08
+        # lists this as a separate factor, so it gets a separate dial.
+        if self.last_any_t is not None and (t - self.last_any_t) > a["return_secs"]:
+            raw *= a["return_boost"]
+            reasons.append("returned")
+
+        # Ended a long dwell. The one signal the replay showed has real spread
+        # in this journal; measured against the previous *focus* event, because
+        # dwell means "how long you sat in a window", not "since anything".
+        elif self.last_focus_t is not None and (t - self.last_focus_t) > a["dwell_secs"]:
+            raw *= a["dwell_boost"]
+            reasons.append("long-dwell")
+
+        # Navigating, not arriving. The debounce already collapsed the burst;
+        # this records that the burst happened and damps what it landed on.
+        if coalesced and coalesced > 1:
+            raw *= a["rapid_switch_penalty"]
+            reasons.append(f"rapid-switch(x{coalesced})")
+
+        self.counts[app] += 1
+        self.seen_day[app] = day
+        self.last_any_t = t
+        if kind == "focus":
+            self.last_focus_t = t
+
+        return {"raw": raw, "reasons": reasons}
+
+
+# --------------------------------------------------------------------------
+# Pass 2 — gates, in simulated (or real) chronological order
+# --------------------------------------------------------------------------
+
+class Gate:
+    """The quiet-period floor, recency damping and repetition penalty.
+
+    Separated from Scorer because these depend on what was *spoken*, not on
+    what happened — the live path and the replay both need to feed decisions
+    back in, and only this half has that feedback loop.
+    """
+
+    def __init__(self, attn: dict):
+        self.attn = attn
+        self.last_spoken_t: float | None = None
+        self.recent: collections.deque = collections.deque()  # (t, app), spoken only
+
+    def apply(self, t: float, app: str, prob: float) -> tuple[float, str]:
+        a = self.attn
+        quiet = float(a["quiet_period_secs"])
+
+        while self.recent and t - self.recent[0][0] > REPETITION_WINDOW_SECS:
+            self.recent.popleft()
+        repeats = sum(1 for (_, x) in self.recent if x == app)
+        if repeats:
+            prob *= a["repetition_penalty"] ** repeats
+
+        gate = "open"
+        if self.last_spoken_t is not None:
+            gap = t - self.last_spoken_t
+            if gap < quiet:
+                return 0.0, "quiet_period"
+            if gap < quiet * SOFT_SUPPRESS_MULT:
+                prob *= a["recent_speech_penalty"]
+                gate = "recent_speech"
+
+        return max(0.0, min(1.0, prob)), gate
+
+    def record_spoken(self, t: float, app: str) -> None:
+        self.last_spoken_t = t
+        self.recent.append((t, app))
+
+
+# --------------------------------------------------------------------------
+# Rate control
+# --------------------------------------------------------------------------
+
+def solve_k(events: list[dict], attn: dict, target_rate: float, seed: int = 0,
+            tol: float = 0.002, iters: int = 40) -> float:
+    """Offline: bisect for the gain that makes the achieved rate hit the target.
+
+    `events` are pre-scored dicts carrying t / app / raw. Exact by construction
+    — it measures the same simulation it is optimizing, gates included, which
+    is the thing the old `target / mean_raw` constant could not do.
+    """
+    if not events:
+        return 1.0
+
+    def achieved(k: float) -> float:
+        rng = random.Random(seed)
+        gate = Gate(attn)
+        spoke = 0
+        for e in events:
+            p, _ = gate.apply(e["t"], e["app"], min(1.0, e["raw"] * k))
+            if rng.random() < p:
+                spoke += 1
+                gate.record_spoken(e["t"], e["app"])
+        return spoke / len(events)
+
+    lo, hi = K_MIN, K_MAX
+    if achieved(hi) < target_rate:      # unreachable — gates dominate
+        return hi
+    for _ in range(iters):
+        mid = math.sqrt(lo * hi)        # geometric: k spans orders of magnitude
+        if achieved(mid) < target_rate:
+            lo = mid
+        else:
+            hi = mid
+        if hi / lo < 1.0 + tol:
+            break
+    return math.sqrt(lo * hi)
+
+
+class RateController:
+    """Live: keep the achieved rate near the target without seeing the future.
+
+    The gain is two terms, and the split matters:
+
+        k = (target / mean_raw) * correction
+
+    The first term *anchors* the gain to the score distribution it is actually
+    scaling, so a typical event lands near the target probability and an
+    interesting one lands above it. The second is a bounded correction for what
+    the quiet-period and recency gates remove downstream, steered by the
+    achieved rate over a trailing window.
+
+    A single free-floating gain was the first implementation and it failed in a
+    way worth recording, because the failure is invisible from the metric it
+    optimizes. It held the achieved rate at 15-16% perfectly well — while `k`
+    random-walked between 1.4 and 8.3 across simulated days. Above about 1.0,
+    `min(1.0, raw * k)` clamps nearly every event to certainty, so the rate
+    stops depending on `k` at all and is set entirely by the quiet-period
+    floor. The controller had no gradient left and wandered; and with every
+    probability pinned at 1.0, *which* event got spoken was decided by
+    whichever one happened to arrive first after the floor expired, not by how
+    interesting it was. The rate dial was fine. The ranking — the thing docs/08
+    promises is independent of it — had quietly stopped existing.
+
+    Hence: anchor first, correct second, and clamp the correction so it can
+    absorb gate losses without ever re-entering saturation.
+
+    Deliberately slow. The target rate is a feel over an afternoon, not a quota
+    per minute, and a twitchy controller makes the system's volume itself
+    unpredictable. Persisted so a restart doesn't re-converge from scratch.
+    """
+
+    # How far the correction may stray from the anchor. Wide enough to cover
+    # the gate losses measured offline (solve_k lands ~1.4x the raw anchor),
+    # narrow enough that it cannot climb into the saturated region.
+    CORRECTION_MIN, CORRECTION_MAX = 0.25, 4.0
+
+    def __init__(self, attn: dict, target_rate: float, state_path: str | None = None,
+                 window: int = 120, adjust: float = 0.05):
+        self.attn = attn
+        self.target = target_rate
+        self.state_path = state_path
+        self.window = window
+        self.adjust = adjust
+        self.decisions: collections.deque = collections.deque(maxlen=window)
+        self.mean_raw = 1.0
+        self.n_raw = 0
+        self.correction = 1.0
+        self._since_adjust = 0
+        self._load()
+
+    def deadband(self) -> tuple[float, float]:
+        """How far the measured rate may sit from target before steering.
+
+        Sized from the sampling noise, not picked. Estimating a rate p from n
+        Bernoulli draws has standard error sqrt(p(1-p)/n); at the real event
+        rate here (~54 eligible events a day, target 15%) that is about four
+        percentage points. A fixed +/-10% band would be *narrower than the
+        noise*, so the controller would read its own sampling error as error
+        to correct and chase it forever — which is exactly what the first
+        version did, swinging the achieved rate between 3.7% and 35% across
+        simulated days while never once sitting still.
+
+        Two standard errors, floored so a tiny window cannot open the band to
+        everything and capped so a large one cannot close it to nothing.
+        """
+        n = max(1, len(self.decisions))
+        p = max(self.target, 0.01)
+        se = math.sqrt(max(p * (1.0 - p), 1e-6) / n)
+        margin = min(max(2.0 * se, 0.25 * self.target), 0.9 * self.target)
+        return self.target - margin, self.target + margin
+
+    def _load(self) -> None:
+        if not self.state_path:
+            return
+        try:
+            with open(self.state_path) as f:
+                st = json.load(f)
+            self.correction = min(self.CORRECTION_MAX,
+                                  max(self.CORRECTION_MIN,
+                                      float(st.get("correction", 1.0))))
+            self.mean_raw = max(1e-6, float(st.get("mean_raw", 1.0)))
+            self.n_raw = int(st.get("n_raw", 0))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+
+    def save(self) -> None:
+        if not self.state_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+            tmp = self.state_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"correction": self.correction, "mean_raw": self.mean_raw,
+                           "n_raw": self.n_raw, "k": self.k,
+                           "target": self.target, "achieved": self.achieved}, f)
+            os.replace(tmp, self.state_path)
+        except OSError:
+            pass
+
+    @property
+    def k(self) -> float:
+        anchor = self.target / self.mean_raw if self.mean_raw > 0 else 1.0
+        return min(K_MAX, max(K_MIN, anchor * self.correction))
+
+    def probability(self, raw: float) -> float:
+        """Scale one raw score, and fold it into the running mean.
+
+        The mean is updated here rather than in `observe` so it tracks every
+        event the scorer saw, spoken or not — it describes the score
+        distribution, which is what the anchor needs, not the outcome.
+        """
+        self.n_raw += 1
+        # Plain running mean while cold, then exponential, so a long-running
+        # process keeps adapting to a changing day instead of being dominated
+        # by its first hour.
+        w = 1.0 / min(self.n_raw, 500)
+        self.mean_raw += w * (raw - self.mean_raw)
+        self.mean_raw = max(1e-6, self.mean_raw)
+        return min(1.0, raw * self.k)
+
+    def observe(self, spoke: bool) -> None:
+        """Feed a decision back in and nudge the correction once warm.
+
+        Steered at most once per quarter-window. Adjusting on every event
+        over-actuates badly: the trailing window only refreshes as fast as
+        events arrive, so a per-event nudge applies dozens of corrections to
+        what is still substantially the same measurement.
+        """
+        self.decisions.append(1 if spoke else 0)
+        self._since_adjust += 1
+        if len(self.decisions) < self.window // 2:
+            return                      # too little evidence to steer on
+        if self._since_adjust < max(1, self.window // 4):
+            return                      # not enough new evidence since last nudge
+
+        lo, hi = self.deadband()
+        achieved = self.achieved
+        if achieved < lo:
+            self.correction = min(self.CORRECTION_MAX,
+                                  self.correction * (1.0 + self.adjust))
+        elif achieved > hi:
+            self.correction = max(self.CORRECTION_MIN,
+                                  self.correction * (1.0 - self.adjust))
+        else:
+            return                      # inside the deadband; leave it alone
+        self._since_adjust = 0
+        self.save()
+
+    @property
+    def achieved(self) -> float:
+        return (sum(self.decisions) / len(self.decisions)) if self.decisions else 0.0
+
+
+# --------------------------------------------------------------------------
+# Workspace settling
+# --------------------------------------------------------------------------
+
+def settle_workspaces(events: list[dict], settle_secs: float) -> list[dict]:
+    """Collapse a burst of workspace switches into the one you landed on.
+
+    Phase 5 measured 90 workspace switches in 7.5 hours with a *median gap of
+    1.4 seconds* — 54% of them came within two seconds of the one before.
+    Those are not five destinations, they are one journey. Speaking each is the
+    single noisiest thing the system could do, and docs/01 had workspace
+    switches as the always-on `quiet` floor, so it would have done exactly that.
+
+    Same rule the focus path already uses (`hypr.debounce_secs`): stay quiet
+    while you're moving, mention where you stopped. At 1.5s this turns 90
+    announcements into 44.
+    """
+    out: list[dict] = []
+    pending: dict | None = None
+    for e in events:
+        if e.get("kind") != "workspace":
+            if pending is not None:
+                out.append(pending)
+                pending = None
+            out.append(e)
+            continue
+        if pending is not None and e["t"] - pending["t"] <= settle_secs:
+            # Still moving: replace the destination, keep the burst's start time
+            # so the run counts as one event rather than resetting the clock.
+            pending = {**e, "t": pending["t"],
+                       "coalesced": (pending.get("coalesced") or 1) + 1}
+        else:
+            if pending is not None:
+                out.append(pending)
+            pending = {**e, "coalesced": 1}
+    if pending is not None:
+        out.append(pending)
+    return out
+
+
+def event_app(e: dict) -> str | None:
+    """The thing an event is 'about', for repetition and novelty purposes."""
+    if e.get("kind") == "workspace":
+        name = e.get("name") or e.get("id")
+        return f"workspace {name}" if name else None
+    return e.get("name") or e.get("cls")

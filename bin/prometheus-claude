@@ -36,6 +36,7 @@ was spoken — whether or not this run actually found something to say.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -315,15 +316,114 @@ def project_name(cwd: str) -> str:
 # hook handlers
 # --------------------------------------------------------------------------
 
+def turn_duration(payload: dict) -> float | None:
+    """Seconds from the user's prompt to now, or None if it can't be known.
+
+    Read from the session transcript, because nothing in the Stop payload
+    carries it and the `UserPromptSubmit` hook that would is not installed.
+    The last entry that is a *genuine* user message starts the turn.
+
+    Two things make that harder than it looks, and both were found by reading
+    real transcripts rather than by assuming:
+
+      - Tool results are also `type: "user"`. A turn with eleven tool calls
+        looks like eleven turns unless they are excluded, which collapses
+        every measured duration to the gap between two tool calls. Measured
+        against a real session, that turned one 1325-second turn into 131
+        turns averaging nine seconds.
+      - `isMeta` entries (command output, system notices) are user-typed in
+        the schema but not in fact.
+
+    Read backwards from the end of the file, in widening windows. Transcripts
+    reach megabytes over a long session and this runs at the end of every
+    single turn, so the common case — a prompt a few exchanges back — must not
+    pay for the worst case. The worst case is real though: in this project's
+    own session the last user prompt sat 1.78 MB from the end of the file after
+    a long stretch of tool calls, so a single fixed 512 KB window found nothing
+    and silently reported "duration unknown" for hours.
+    """
+    path = payload.get("transcript_path")
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        size = os.path.getsize(path)
+        for window in TAIL_WINDOWS:
+            started = _last_prompt_ts(path, window)
+            if started is not None:
+                return max(0.0, time.time() - started)
+            if window >= size:
+                break          # already read the whole file; it isn't there
+    except (OSError, ValueError, TypeError) as e:
+        LOG.debug("stop.duration_unknown", str(e))
+    return None
+
+
+# Widening tail windows. The first covers an ordinary turn; the last covers
+# a whole long session's transcript.
+TAIL_WINDOWS = (256 * 1024, 2 * 1024 * 1024, 16 * 1024 * 1024)
+
+
+def _last_prompt_ts(path: str, max_bytes: int) -> float | None:
+    """Timestamp of the last genuine user prompt within the file's tail."""
+    for line in reversed(tail_lines(path, max_bytes)):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("type") != "user" or rec.get("isMeta") or rec.get("isSidechain"):
+            continue
+        if rec.get("toolUseResult") is not None:
+            continue
+        content = (rec.get("message") or {}).get("content")
+        if isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            continue
+        stamp = rec.get("timestamp")
+        if not stamp:
+            continue
+        return datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    return None
+
+
+def tail_lines(path: str, max_bytes: int) -> list[str]:
+    """The last complete lines of a file, without reading all of it."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        start = max(0, size - max_bytes)
+        f.seek(start)
+        data = f.read()
+    text = data.decode("utf-8", "replace")
+    lines = text.split("\n")
+    if start > 0 and lines:
+        lines = lines[1:]          # first line is probably truncated
+    return [l for l in lines if l.strip()]
+
+
 def handle_stop(payload: dict, cfg: dict) -> None:
     sc = cfg["speak"]["claude_finished"]
     if not sc.get("enabled", True):
         LOG.debug("stop.disabled")
         return
 
+    # Always measured, even when the threshold is 0 and nothing is gated on
+    # it. docs/04 task 5.1a parked the "what should min_turn_secs be?" question
+    # for Phase 5 to answer from evidence — and Phase 5 found there was no
+    # evidence, because the duration had never been recorded. Logging it on
+    # every turn means the question answers itself from a week of real use
+    # rather than needing another round of guessing.
+    duration = turn_duration(payload)
+    min_turn = float(sc.get("min_turn_secs", 0) or 0)
+    if min_turn and duration is not None and duration < min_turn:
+        LOG.info("stop.too_short",
+                 "turn ended too quickly to have been left alone — staying quiet",
+                 turn_secs=round(duration, 1), min_turn_secs=min_turn)
+        return
+
     raw = (payload.get("last_assistant_message") or "").strip()
     if not raw:
-        LOG.info("stop.empty", "no last_assistant_message — speaking the bare fact of it")
+        LOG.info("stop.empty", "no last_assistant_message — speaking the bare fact of it",
+                 turn_secs=round(duration, 1) if duration is not None else None)
         line = phrase("claude_finished")
         if line:
             say(line, sc.get("priority", "normal"))
@@ -333,7 +433,8 @@ def handle_stop(payload: dict, cfg: dict) -> None:
 
     cleaned = strip_for_speech(raw)
     if not cleaned:
-        LOG.info("stop.stripped_to_nothing", input=preview(raw))
+        LOG.info("stop.stripped_to_nothing", input=preview(raw),
+                 turn_secs=round(duration, 1) if duration is not None else None)
         line = phrase("claude_finished")
         if line:
             say(line, sc.get("priority", "normal"))
@@ -344,17 +445,21 @@ def handle_stop(payload: dict, cfg: dict) -> None:
 
     if word_count < threshold:
         LOG.info("stop.short_circuit", input=preview(raw), output=cleaned,
-                  word_count=word_count, threshold=threshold)
+                 word_count=word_count, threshold=threshold,
+                 turn_secs=round(duration, 1) if duration is not None else None)
         say(cleaned, sc.get("priority", "normal"))
         return
 
-    LOG.debug("stop.summarizing", input=preview(raw), word_count=word_count, threshold=threshold)
+    LOG.debug("stop.summarizing", input=preview(raw), word_count=word_count,
+                  threshold=threshold,
+                  turn_secs=round(duration, 1) if duration is not None else None)
     summary = summarize(raw)
     if not summary:
         LOG.info("stop.silent", "summarizer produced nothing — degrading to silence",
                   input=preview(raw))
         return
-    LOG.info("stop.summarized", input=preview(raw), output=summary)
+    LOG.info("stop.summarized", input=preview(raw), output=summary,
+             turn_secs=round(duration, 1) if duration is not None else None)
     say(summary, sc.get("priority", "normal"))
 
 

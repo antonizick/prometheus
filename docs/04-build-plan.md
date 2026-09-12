@@ -227,22 +227,56 @@ runs.
 
 The phase that decides whether this gets used or turned off.
 
-| # | Task |
-|---|---|
-| 5.1 | Tune from real journal data — what was spoken that shouldn't have been? |
-| 5.1a | **Revisit `speak.claude_finished.min_turn_secs`** — deferred from Phase 3 on purpose. Currently `0`, so it speaks after every Claude turn; almost certainly too chatty, but the right number is found by ear, not by guessing. Evidence: `prometheus feedback --list`, `prometheus transcript -v` |
-| 5.2 | Verbosity profiles: quiet / normal / chatty |
-| 5.3 | Voice and tone pass (see [06](06-voice-and-tone.md)) — listened to, not read |
-| 5.4 | Context gates: screen locked, fullscreen, other audio playing |
-| 5.5 | Migrate `omarchy-tts-read-cursor` / `-terminal-live` to route via the broker |
-| 5.6 | Re-measure overhead; update [07](07-resource-profile.md) with real numbers |
-| 5.7 | Write the operator's manual (`docs/08-operating.md`) |
+| # | Task | |
+|---|---|---|
+| 5.1 | Tune from real journal data — what was spoken that shouldn't have been? | ✅ |
+| 5.1a | **Revisit `speak.claude_finished.min_turn_secs`** — deferred from Phase 3 on purpose. Currently `0`, so it speaks after every Claude turn; almost certainly too chatty, but the right number is found by ear, not by guessing. Evidence: `prometheus feedback --list`, `prometheus transcript -v` | ✅ |
+| 5.2 | Verbosity profiles: quiet / normal / chatty | ✅ |
+| 5.3 | Voice and tone pass (see [06](06-voice-and-tone.md)) — listened to, not read | ◑ staged |
+| 5.4 | Context gates: screen locked, fullscreen, other audio playing | ✅ |
+| 5.5 | Migrate `omarchy-tts-read-cursor` / `-terminal-live` to route via the broker | ✅ |
+| 5.6 | Re-measure overhead; update [07](07-resource-profile.md) with real numbers | ✅ |
+| 5.7 | Write the operator's manual (`docs/08-operating.md`) | ☐ not started |
+
+**Built 2026-09-12** — see [notes/2026-09-12-phase-5.md](../notes/2026-09-12-phase-5.md).
+
+Headline, replayed against 7.8 hours of real journal: ambient narration as
+designed would have spoken **14.7 times an hour** with **46 %** of those
+utterances carrying any reason beyond a coin flip. After tuning: **1.2 times an
+hour, 100 % carrying a reason**, and the 15 % target rate is actually hit
+(it was achieving 9.6 %).
+
+Three of the five interest signals turned out to be dead against real data —
+`returned` had literally never fired, because its 3600-second threshold sat
+past the longest real gap of 3454 seconds. Workspace switches, which docs/01
+made the always-on `quiet` floor, turned out to be the *most* frequent event
+class (90 in 7.8 h, median gap 1.4 s) and were absorbing ~90 % of all ambient
+speech.
+
+5.3 is **staged, not signed off**: the phrase bank was audited across four
+regenerations and **53 lines cut** — `"Files changed, Claude Code."` for a
+window gaining focus, `"Claude Code's running on Prometheus."` for a *blocked*
+agent, `"Claudes awaits your response."` — and every gap that admitted them is
+closed at the source, in `banned_words`, `unknowable_words` and seven new
+validator rules. The bank is back at target (284 phrasings) and clean.
+
+But the listening pass itself is Nick's, by ear, and that is the whole point of
+the task: three of those defects were only findable in `prometheus transcript`,
+downstream of the speaker, after passing every static check.
+`experiments/phrasebook/play.sh` ⚠ makes sound.
 
 **Acceptance:**
 - A full working day with it on, without wanting to turn it off — *the only
-  acceptance criterion that really matters*
-- Only one thing ever holds the audio device
-- Documented numbers match measured ones
+  acceptance criterion that really matters* → **outstanding.** Narration went
+  live at the end of this phase; the day it has to survive hasn't happened yet.
+- Only one thing ever holds the audio device → **met.** The three
+  `omarchy-tts-*` paths were the last producers spawning their own Piper, and
+  they now submit intents (task 5.5). They also inherit the microphone gate and
+  the shut-up key by doing so.
+- Documented numbers match measured ones → **met**, and the harness that
+  checks it was wrong three different ways before it agreed: 0.000 s CPU and
+  two context switches across a 600-second window, 142.8 MB against a 150 MB
+  budget.
 
 ---
 

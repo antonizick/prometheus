@@ -1,40 +1,35 @@
 #!/usr/bin/env python3
-"""Replay harness — interest scoring over journalled history (docs/04, tasks
-1.7-1.8; weights documented in docs/08-personality-and-config.md).
+"""Replay harness — interest scoring over journalled history.
 
-Runs the "would this have been spoken?" decision over
-~/.local/state/prometheus/journal without speaking anything. Phase 1 builds no
-live narration (docs/04: "no narration yet ... collecting data first") — this
-is the offline tool that makes the eventual narration policy *evidence-based*
-instead of guessed, by replaying real desktop history against the attention
-weights already scaffolded in config.json.
+Answers "what would this have said?" against real desktop history, without
+speaking anything and without waiting a week to find out.
 
-    experiments/replay-scoring.py                  # journal, default weights
-    experiments/replay-scoring.py --verbose         # per-event decisions
-    experiments/replay-scoring.py --rate 0.05       # try a different target
-    experiments/replay-scoring.py --since 2026-09-11T00:00:00
+    experiments/replay-scoring.py                   # current config
+    experiments/replay-scoring.py --verbose         # every decision, with reasons
+    experiments/replay-scoring.py --rate 0.05       # what 5% would have felt like
+    experiments/replay-scoring.py --compare         # old scoring vs new, side by side
+    experiments/replay-scoring.py --verbosity quiet # what a tier actually yields
+    experiments/replay-scoring.py --hourly          # utterances per hour, worst hour
+    experiments/replay-scoring.py --since 2026-09-11T18:00:00
 
-Two passes over the journal, both read-only:
+The scoring itself lives in `bin/prometheus-attention` and is imported, not
+reimplemented — the live path (`prometheus-hypr`) imports the same file. A
+harness that only approximates the real rules is worse than no harness, because
+it produces confident numbers about a system that doesn't exist.
 
-  Pass 1 walks it chronologically and scores every open/close/focus/
-  fullscreen event against novelty, rarity, odd-hour and rapid-switch
-  signals, using only what's known *up to that point* — no lookahead.
-  workspace events aren't scored; docs/01 puts workspace switches in the
-  `quiet` tier, i.e. always-on, so they're reported separately as a fixed
-  baseline rather than run through the probability gate.
+Two passes, both read-only:
 
-  Pass 2 re-walks the scored events, scales every raw score by a constant so
-  the mean selection probability lands on the target rate (docs/08: "interest
-  ranking and volume are independent dials"), then applies the hard
-  quiet-period floor and repetition/recency penalties *in simulated order*
-  (a penalty depends on what the simulation already decided to "speak"), and
-  draws each decision from a seeded RNG for reproducibility.
+  Pass 1 walks the journal chronologically and scores each event using only
+  what is known at that point — no lookahead, exactly as the live path sees it.
+  Workspace bursts are settled first (see `settle_workspaces`).
 
-"Return after absence" reuses novelty_boost rather than a dedicated config
-weight — config.json's attention block doesn't have a separate one, and
-inventing an unconfigured knob would make this drift from what's actually
-tunable. Sequence-oddity scoring from docs/08's table isn't implemented for
-the same reason: no weight exists for it yet.
+  Pass 2 solves for the gain that lands the achieved rate on the target, then
+  re-walks applying the quiet-period floor and repetition penalties in
+  simulated order, drawing from a seeded RNG so runs are reproducible.
+
+`--compare` reproduces the pre-Phase-5 scoring alongside the current one. That
+is what the Phase 5 weight changes were argued from, and re-running it is how
+you check the argument still holds on a longer journal.
 """
 
 from __future__ import annotations
@@ -42,11 +37,12 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime
+import importlib.machinery
+import importlib.util
 import json
 import os
 import random
 import sys
-import time
 
 HOME = os.path.expanduser("~")
 CONFIG_DIR = os.environ.get("PROMETHEUS_CONFIG_DIR") or os.path.join(
@@ -56,23 +52,90 @@ STATE_DIR = os.environ.get("PROMETHEUS_STATE_DIR") or os.path.join(
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 DEFAULT_JOURNAL = os.path.join(STATE_DIR, "journal")
 
-DEFAULT_ATTENTION = {
-    "novelty_boost": 2.0,
-    "rarity_boost": 1.5,
-    "odd_hour_boost": 1.8,
-    "recent_speech_penalty": 0.15,
-    "repetition_penalty": 0.4,
-    "rapid_switch_penalty": 0.1,
-    "quiet_period_secs": 45,
+BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bin")
+
+
+def load_attention_module():
+    path = os.path.normpath(os.path.join(BIN_DIR, "prometheus-attention"))
+    loader = importlib.machinery.SourceFileLoader("prometheus_attention", path)
+    spec = importlib.util.spec_from_loader("prometheus_attention", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+A = load_attention_module()
+
+
+# --------------------------------------------------------------------------
+# The pre-Phase-5 scoring, kept verbatim for --compare
+# --------------------------------------------------------------------------
+
+LEGACY_ATTENTION = {
+    "novelty_boost": 2.0, "rarity_boost": 1.5, "odd_hour_boost": 1.8,
+    "recent_speech_penalty": 0.15, "repetition_penalty": 0.4,
+    "rapid_switch_penalty": 0.1, "quiet_period_secs": 45,
 }
-DEFAULT_TARGET_RATE = 0.15
+LEGACY_SCORED_KINDS = ("open", "close", "focus", "fullscreen")
+LEGACY_ABSENCE_GAP_SECS = 3600
 
-SCORED_KINDS = ("open", "close", "focus", "fullscreen")
-RARE_THRESHOLD = 2          # at most this many prior sightings still counts as rare
-ABSENCE_GAP_SECS = 3600     # gap since any event that counts as "returning"
-REPETITION_WINDOW_SECS = 600
-SOFT_SUPPRESS_MULT = 3      # x quiet_period_secs: fades from hard floor to normal
 
+def legacy_score(events: list[dict], attn: dict) -> list[dict]:
+    counts: collections.Counter = collections.Counter()
+    seen_today: dict[str, str] = {}
+    last_any_t: float | None = None
+    scored = []
+    for e in events:
+        if e.get("kind") not in LEGACY_SCORED_KINDS:
+            continue
+        app = e.get("name") or e.get("cls")
+        if not app:
+            continue
+        t = e.get("t", 0)
+        day = datetime.date.fromtimestamp(t).isoformat()
+        hour = datetime.datetime.fromtimestamp(t).hour
+        raw, reasons = 1.0, []
+        if seen_today.get(app) != day:
+            raw *= attn["novelty_boost"]; reasons.append("novel-today")
+        if counts[app] <= A.RARE_THRESHOLD:
+            raw *= attn["rarity_boost"]; reasons.append("rare")
+        if hour < 6 or hour >= 23:
+            raw *= attn["odd_hour_boost"]; reasons.append("odd-hour")
+        if last_any_t is not None and (t - last_any_t) > LEGACY_ABSENCE_GAP_SECS:
+            raw *= attn["novelty_boost"]; reasons.append("returned")
+        co = e.get("coalesced") or 0
+        if co > 1:
+            raw *= attn["rapid_switch_penalty"]; reasons.append(f"rapid-switch(x{co})")
+        scored.append({"t": t, "kind": e["kind"], "app": app, "raw": raw,
+                       "reasons": reasons})
+        counts[app] += 1
+        seen_today[app] = day
+        last_any_t = t
+    return scored
+
+
+def legacy_decide(scored: list[dict], attn: dict, target_rate: float,
+                  seed: int) -> list[dict]:
+    """The old constant-gain normalization: k = target / mean(raw), applied once."""
+    if not scored:
+        return []
+    mean_raw = sum(s["raw"] for s in scored) / len(scored)
+    k = (target_rate / mean_raw) if mean_raw > 0 else 0.0
+    rng = random.Random(seed)
+    gate = A.Gate(attn)
+    out = []
+    for s in scored:
+        prob, g = gate.apply(s["t"], s["app"], min(1.0, s["raw"] * k))
+        spoke = rng.random() < prob
+        if spoke:
+            gate.record_spoken(s["t"], s["app"])
+        out.append({**s, "prob": prob, "gate": g, "would_speak": spoke})
+    return out
+
+
+# --------------------------------------------------------------------------
+# Loading
+# --------------------------------------------------------------------------
 
 def strip_jsonc(text: str) -> str:
     out, in_str, esc, i = [], False, False, 0
@@ -99,16 +162,12 @@ def strip_jsonc(text: str) -> str:
     return "".join(out)
 
 
-def load_attention_and_rate() -> tuple[dict, float]:
+def load_config() -> dict:
     try:
         with open(CONFIG_FILE) as f:
-            raw = json.loads(strip_jsonc(f.read()))
+            return json.loads(strip_jsonc(f.read()))
     except (OSError, ValueError):
-        raw = {}
-    attention = dict(DEFAULT_ATTENTION)
-    attention.update(raw.get("attention", {}))
-    rate = raw.get("speak", {}).get("desktop_activity", {}).get("target_rate", DEFAULT_TARGET_RATE)
-    return attention, float(rate)
+        return {}
 
 
 def load_journal(path: str, since_ts: float | None) -> list[dict]:
@@ -143,98 +202,49 @@ def parse_since(s: str | None) -> float | None:
 
 
 # --------------------------------------------------------------------------
-# Pass 1 — raw interest score, no lookahead
+# Current scoring
 # --------------------------------------------------------------------------
 
-def score_events(events: list[dict], attn: dict) -> list[dict]:
-    counts_total: dict[str, int] = collections.Counter()
-    seen_today: dict[str, str] = {}   # app -> date string of last-seen day
-    last_any_t: float | None = None
-    scored = []
+def score_current(events: list[dict], attn: dict, kinds: set,
+                  require_reason: set) -> list[dict]:
+    """Score every event, return only the ones this verbosity may speak about.
 
+    The scorer is fed *everything*, including kinds the current tier will never
+    narrate. Verbosity controls what it talks about, not what it knows — a
+    focus change still counts as activity for "returned after an absence" even
+    at `quiet`, where focus changes are never spoken. Filtering before scoring
+    was the first cut here and it silently broke dwell tracking: with focus
+    events removed, `last_focus_t` never advanced and `long-dwell` never fired.
+    """
+    scorer = A.Scorer(attn)
+    scored = []
     for e in events:
-        if e.get("kind") not in SCORED_KINDS:
+        kind = e.get("kind")
+        if kind not in A.SCORED_KINDS:
             continue
-        app = e.get("name") or e.get("cls")
+        app = A.event_app(e)
         if not app:
             continue
         t = e.get("t", 0)
-        day = datetime.date.fromtimestamp(t).isoformat()
-        hour = datetime.datetime.fromtimestamp(t).hour
-
-        raw = 1.0
-        reasons = []
-
-        if seen_today.get(app) != day:
-            raw *= attn["novelty_boost"]
-            reasons.append("novel-today")
-        if counts_total[app] <= RARE_THRESHOLD:
-            raw *= attn["rarity_boost"]
-            reasons.append("rare")
-        if hour < 6 or hour >= 23:
-            raw *= attn["odd_hour_boost"]
-            reasons.append("odd-hour")
-        if last_any_t is not None and (t - last_any_t) > ABSENCE_GAP_SECS:
-            raw *= attn["novelty_boost"]
-            reasons.append("returned")
-        coalesced = e.get("coalesced") or 0
-        if coalesced > 1:
-            raw *= attn["rapid_switch_penalty"]
-            reasons.append(f"rapid-switch(x{coalesced})")
-
-        scored.append({"t": t, "kind": e["kind"], "app": app, "raw": raw, "reasons": reasons})
-
-        counts_total[app] += 1
-        seen_today[app] = day
-        last_any_t = t
-
+        s = scorer.score(t, kind, app, e.get("coalesced") or 0)
+        if kind not in kinds:
+            continue
+        if kind in require_reason and not A.meaningful_reasons(s["reasons"]):
+            continue
+        scored.append({"t": t, "kind": kind, "app": app, **s})
     return scored
 
 
-# --------------------------------------------------------------------------
-# Pass 2 — normalize to the target rate, apply quiet-period + repetition,
-# draw decisions in simulated chronological order
-# --------------------------------------------------------------------------
-
-def decide(scored: list[dict], attn: dict, target_rate: float, seed: int) -> list[dict]:
-    if not scored:
-        return []
-    mean_raw = sum(s["raw"] for s in scored) / len(scored)
-    k = (target_rate / mean_raw) if mean_raw > 0 else 0.0
-
+def decide(scored: list[dict], attn: dict, k: float, seed: int) -> list[dict]:
     rng = random.Random(seed)
-    quiet = float(attn["quiet_period_secs"])
-    last_spoken_t: float | None = None
-    recent: collections.deque[tuple[float, str]] = collections.deque()  # (t, app), spoken only
-
+    gate = A.Gate(attn)
     out = []
     for s in scored:
-        t, app = s["t"], s["app"]
-        prob = min(1.0, s["raw"] * k)
-
-        while recent and t - recent[0][0] > REPETITION_WINDOW_SECS:
-            recent.popleft()
-        recent_count = sum(1 for (_, a) in recent if a == app)
-        if recent_count:
-            prob *= attn["repetition_penalty"] ** recent_count
-
-        gate = "open"
-        if last_spoken_t is not None:
-            gap = t - last_spoken_t
-            if gap < quiet:
-                prob = 0.0
-                gate = "quiet_period"
-            elif gap < quiet * SOFT_SUPPRESS_MULT:
-                prob *= attn["recent_speech_penalty"]
-                gate = "recent_speech"
-
-        prob = max(0.0, min(1.0, prob))
-        would_speak = rng.random() < prob
-        if would_speak:
-            last_spoken_t = t
-            recent.append((t, app))
-
-        out.append({**s, "prob": prob, "gate": gate, "would_speak": would_speak})
+        prob, g = gate.apply(s["t"], s["app"], min(1.0, s["raw"] * k))
+        spoke = rng.random() < prob
+        if spoke:
+            gate.record_spoken(s["t"], s["app"])
+        out.append({**s, "prob": prob, "gate": g, "would_speak": spoke})
     return out
 
 
@@ -242,55 +252,142 @@ def decide(scored: list[dict], attn: dict, target_rate: float, seed: int) -> lis
 # Reporting
 # --------------------------------------------------------------------------
 
+def signal_census(scored: list[dict]) -> list[tuple[str, int]]:
+    c: collections.Counter = collections.Counter()
+    for s in scored:
+        for r in s["reasons"]:
+            c[r.split("(")[0]] += 1
+    return c.most_common()
+
+
+def report_hourly(spoken: list[dict]) -> None:
+    by_hour: collections.Counter = collections.Counter()
+    for d in spoken:
+        by_hour[datetime.datetime.fromtimestamp(d["t"]).strftime("%H")] += 1
+    if not by_hour:
+        print("hourly         : nothing spoken")
+        return
+    print("hourly         :")
+    for h in sorted(by_hour):
+        bar = "#" * by_hour[h]
+        print(f"    {h}:00  {by_hour[h]:>3}  {bar}")
+    worst = by_hour.most_common(1)[0]
+    print(f"    worst hour: {worst[0]}:00 with {worst[1]}")
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--journal", default=DEFAULT_JOURNAL)
     ap.add_argument("--rate", type=float, default=None,
                     help="override speak.desktop_activity.target_rate")
     ap.add_argument("--since", default=None,
                     help="unix timestamp or ISO datetime; default: whole journal")
+    ap.add_argument("--verbosity", default=None,
+                    choices=sorted(A.VERBOSITY_KINDS),
+                    help="which event kinds are eligible; default: config")
+    ap.add_argument("--settle", type=float, default=None,
+                    help="workspace settle window; default: hypr.workspace_settle_secs")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--compare", action="store_true",
+                    help="also run the pre-Phase-5 scoring, for contrast")
+    ap.add_argument("--hourly", action="store_true", help="utterances per hour")
     ap.add_argument("-v", "--verbose", action="store_true", help="print every decision")
     a = ap.parse_args()
 
-    attn, cfg_rate = load_attention_and_rate()
-    target_rate = a.rate if a.rate is not None else cfg_rate
-    since_ts = parse_since(a.since)
+    cfg = load_config()
+    attn = A.attention_from_config(cfg)
+    target_rate = a.rate if a.rate is not None else A.target_rate_from_config(cfg)
+    verbosity = a.verbosity or cfg.get("verbosity", "normal")
+    kinds = A.kinds_for_verbosity(verbosity, cfg)
+    require_reason = A.require_reason_kinds(cfg)
+    hypr = cfg.get("hypr") or {}
+    settle = a.settle if a.settle is not None else float(
+        hypr.get("workspace_settle_secs",
+                 max(2.0, float(hypr.get("debounce_secs", 1.5)))))
 
-    events = load_journal(a.journal, since_ts)
+    events = load_journal(a.journal, parse_since(a.since))
     if not events:
         print("no journal events in range — nothing to replay")
         return 0
 
-    workspace_switches = sum(1 for e in events if e.get("kind") == "workspace")
-    scored = score_events(events, attn)
-    decided = decide(scored, attn, target_rate, a.seed)
+    raw_workspace = sum(1 for e in events if e.get("kind") == "workspace")
+    events = A.settle_workspaces(events, settle)
+    settled_workspace = sum(1 for e in events if e.get("kind") == "workspace")
+
+    scored = score_current(events, attn, kinds, require_reason)
+    if not scored:
+        print(f"no scorable events at verbosity={verbosity} — nothing to replay")
+        return 0
+    k = A.solve_k(scored, attn, target_rate, a.seed)
+    decided = decide(scored, attn, k, a.seed)
+    spoken = [d for d in decided if d["would_speak"]]
 
     if a.verbose:
         for d in decided:
             ts = datetime.datetime.fromtimestamp(d["t"]).strftime("%H:%M:%S")
             mark = "SPEAK" if d["would_speak"] else "  .  "
-            reasons = ",".join(d["reasons"]) or "-"
             print(f"{ts} [{mark}] {d['kind']:<10} {d['app']:<20} "
-                  f"prob={d['prob']:.3f} gate={d['gate']:<13} {reasons}")
-
-    spoken = [d for d in decided if d["would_speak"]]
-    by_app = collections.Counter(d["app"] for d in spoken)
+                  f"prob={d['prob']:.3f} gate={d['gate']:<13} "
+                  f"{','.join(d['reasons']) or '-'}")
 
     span = (events[-1]["t"] - events[0]["t"]) if len(events) > 1 else 0
+    hours = span / 3600 or 1e-9
+
     print()
     print(f"journal        : {a.journal}")
-    print(f"window         : {span / 60:.1f} min, {len(events)} raw events "
-          f"({workspace_switches} workspace, {len(scored)} scorable)")
-    print(f"target rate    : {target_rate:.0%}")
-    print(f"would speak    : {len(spoken)}/{len(scored)}"
-          f" ({(len(spoken) / len(scored) * 100) if scored else 0:.1f}% achieved)")
-    print(f"+ workspace    : always spoken (quiet-tier baseline), {workspace_switches} more")
+    print(f"window         : {span / 60:.1f} min ({hours:.1f} h), "
+          f"{len(events)} events after settling")
+    print(f"verbosity      : {verbosity}  (kinds: {', '.join(sorted(kinds))})")
+    gated = sorted(kinds & require_reason)
+    if gated:
+        print(f"needs a reason : {', '.join(gated)} "
+              f"(never spoken on a bare draw)")
+    print(f"workspace      : {raw_workspace} switches -> {settled_workspace} landings "
+          f"(settle {settle}s)")
+    print(f"target rate    : {target_rate:.0%}   gain k={k:.3f}")
+    print(f"would speak    : {len(spoken)}/{len(scored)} "
+          f"({len(spoken) / len(scored) * 100:.1f}% achieved)")
+    print(f"               : {len(spoken) / hours:.1f} utterances/hour")
+
+    with_signal = sum(1 for d in spoken if d["reasons"])
+    print(f"carried a reason: {with_signal}/{len(spoken)} "
+          f"({(with_signal / len(spoken) * 100) if spoken else 0:.0f}% — "
+          f"the rest are bare draws at the base rate)")
+
+    print("signal census  : (how often each fired across all scorable events)")
+    for name, n in signal_census(scored):
+        print(f"    {name:<16} {n:>4}/{len(scored)}  ({n / len(scored) * 100:5.1f}%)")
+
+    by_app = collections.Counter(d["app"] for d in spoken)
     if by_app:
         print("by app         :")
         for app, n in by_app.most_common(10):
             print(f"    {n:>3}  {app}")
+
+    if a.hourly:
+        report_hourly(spoken)
+
+    if a.compare:
+        legacy_events = load_journal(a.journal, parse_since(a.since))
+        ls = legacy_score(legacy_events, LEGACY_ATTENTION)
+        ld = legacy_decide(ls, LEGACY_ATTENTION, target_rate, a.seed)
+        lspoken = [d for d in ld if d["would_speak"]]
+        lws = sum(1 for e in legacy_events if e.get("kind") == "workspace")
+        lsig = sum(1 for d in lspoken if d["reasons"])
+        print()
+        print("--- pre-Phase-5 scoring, same journal ---")
+        print(f"would speak    : {len(lspoken)}/{len(ls)} "
+              f"({len(lspoken) / len(ls) * 100:.1f}% achieved, target {target_rate:.0%})")
+        print(f"               : {len(lspoken) / hours:.1f} utterances/hour, "
+              f"plus {lws} workspace switches spoken unconditionally "
+              f"= {(len(lspoken) + lws) / hours:.1f}/hour")
+        print(f"carried a reason: {lsig}/{len(lspoken)} "
+              f"({(lsig / len(lspoken) * 100) if lspoken else 0:.0f}%)")
+        print("signal census  :")
+        for name, n in signal_census(ls):
+            print(f"    {name:<16} {n:>4}/{len(ls)}  ({n / len(ls) * 100:5.1f}%)")
+
     return 0
 
 

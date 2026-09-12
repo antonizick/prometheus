@@ -197,3 +197,139 @@ rather than something you are told.
 
 The specific thing to listen for: **imagine hearing this particular sentence for
 the fortieth time.** Most phrasings that pass on the page fail that test.
+
+---
+
+## What the Phase 5 pass found
+
+*(2026-09-12 — see [notes/2026-09-12-phase-5.md](../notes/2026-09-12-phase-5.md).
+The listening review itself is Nick's; this is the audit that preceded it, and
+what it changed.)*
+
+It took **five regenerations**, and each one produced a *different* family of
+bad phrasings once the previous family was blocked:
+
+```
+1. invented detail          "Files changed, Claude Code."
+2. computer-science nouns   "New Brave process launched."
+3. personification          "Brave, humming quietly tonight."
+4. self-narration           "Lucent is aware Brave is opening."
+   + prediction             "Long night ahead in Brave."
+5. on-screen furniture      "Brave's interface shows itself."
+   + polarity               "Claude processing input on Prometheus."   <- BLOCKED
+```
+
+That is the finding rather than an accident of process: **a validator tightened
+against what a model did last time tells you nothing about where it will go
+next**, and it goes somewhere new every time it runs out of true things to say.
+
+So the bank was left **clean rather than converged**, and what bounds the
+problem is not a longer word list. It is the seeds (134 hand-written lines,
+not one of which failed any check in any round), the permanence of vetoes, and
+the audit below — run after *every* regeneration, not once.
+
+Auditing the generated bank turned up **53 phrasings cut** across several
+distinct failure modes, all exclusively in model-written lines — not one
+hand-written seed failed any check, old or new.
+
+**1. Invented detail.** The bank contained, for a window merely gaining focus:
+
+> "Files changed, Claude Code."
+> "Brave blinks briefly."
+> "Prompt waiting patiently in the terminal."
+
+None of those are things this system can know. And one was worse than invented —
+`claude_blocked_project` carried *"Claude Code's running on Prometheus."*, which
+reports a **blocked** agent as running: the exact "outcomes reported backwards"
+failure the acceptance criteria name.
+
+The pattern is worth stating plainly, because it will recur at every
+regeneration: **asked to say something about a bare focus change, a model
+reaches for a detail that would make it interesting, and every detail available
+to it is one it invented.** This is the same force that made forty-per-moment
+the wrong target in [08](08-personality-and-config.md); it simply survived at
+smaller numbers.
+
+**2. Computer-science vocabulary.** A distinct habit, and one the original
+banned list did not touch — it was aimed at *corporate* filler ("active",
+"ready", "successfully"):
+
+> "New Brave process launched."   "Obsidian session beginning."
+> "Claude's input queue empty."   "Another thread asking from Claude…"
+
+A session and a queue are not things you hear about, they are things a program
+has. Principle 3 again: he knows he opened an app, and being told a "process
+launched" is the same fact in a worse costume.
+
+**And one defect that only sound reveals.** The bank contained
+*"Claudes awaits your response."* The missing apostrophe is nearly invisible on
+this page and unmistakable out loud. That is the entire argument for this
+section — a text review cannot catch it. It is now a validator rule
+(`plural_proper_noun`), along with a check that a phrasing ends like a sentence
+at all, after *"Brave session freshly started"* was banked with no full stop.
+
+All are vetoed permanently, and the vocabulary that admitted them is in the
+spec's `banned_words` and `unknowable_words`, so regeneration cannot bring the
+family back.
+
+### The last three were found in the transcript, not the bank
+
+Worth separating, because the method matters. Reading what the system had
+*actually said* during the day — `prometheus transcript`, not `phrase --show` —
+turned up this, spoken aloud:
+
+> "Claude's waiting on your input— Prometheus."
+
+A missing space before the em-dash: a typo on the page, a missing beat out
+loud. Pulling on it found two more, all three in `claude_blocked_project` —
+the most valuable alert the system has:
+
+| line | defect |
+|---|---|
+| `"…your input— {project}."` | no space before the em-dash |
+| `"Answer needed for Claude - {project}."` | hyphen where every seed uses an em-dash; Piper phrases them differently |
+| `"He's stuck in {project} - Claude."` | **`he` is a banned word** — and Claude is stuck, not "he" |
+
+The last is the instructive one. `he` / `him` / `his` are banned precisely to
+stop the system talking about Nick in the third person, and the check passed
+anyway: `normalise()` closes apostrophes up so `"didn't"` stays one token, and
+that same rule turns `"he's"` into `"hes"`, which `" he "` never matches. **The
+ban had a hole exactly the width of a contraction.**
+
+Now three more validator rules — `banned_word_contraction`, `dash_spacing`,
+`hyphen_as_dash` — and eight more lines cut.
+
+**This is the argument for the listening review in one paragraph.** Everything
+above was found by auditing the bank; these were only findable downstream of
+the speaker. A phrasing can pass every static check the validator has and still
+be wrong in a way that only shows up as sound.
+
+### The audit, as a routine
+
+Run this after any `prometheus regenerate`. It takes a couple of minutes and it
+found something new on all four attempts — the word lists only catch what the
+model did *last* time.
+
+```bash
+prometheus-phrasebank verify          # the mechanical rules, first
+
+# 2. Draw one line per moment exactly as the runtime would. This is what
+#    surfaced "Lucent is aware Brave is opening." — nothing static caught it.
+for m in app_first_today app_returned app_rare app_odd_hour app_opened; do
+  printf '%-20s ' "$m"; prometheus phrase $m --slot app=Brave -n 1
+done
+
+# 3. Read what it has actually been saying. Three defects were only ever
+#    visible here, after passing every check above.
+prometheus transcript -n 40
+
+# 4. Then listen.  ⚠ MAKES SOUND
+experiments/build-phrasebook-audio.py
+experiments/phrasebook/play.sh session
+```
+
+What to look for, in the order the failures actually appeared: detail it cannot
+know, computer-science vocabulary, personification, the system naming itself,
+and guesses about what happens next. Cut with
+`prometheus-phrasebank veto <moment> "<the words>"` — permanent, and survives
+every future regeneration.
